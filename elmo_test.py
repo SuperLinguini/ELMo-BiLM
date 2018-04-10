@@ -25,6 +25,7 @@ from mxnet.gluon import nn, Block
 from base import get_rnn_cell
 # from mxnet.gluon import data, text
 
+
 import gluonnlp as nlp
 # from gluonnlp.models.language_model import StandardRNN, AWDRNN
 
