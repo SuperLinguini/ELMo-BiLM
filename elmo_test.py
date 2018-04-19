@@ -25,7 +25,6 @@ from mxnet.gluon import nn, Block
 from base import get_rnn_cell
 # from mxnet.gluon import data, text
 
-
 import gluonnlp as nlp
 # from gluonnlp.models.language_model import StandardRNN, AWDRNN
 
@@ -38,7 +37,7 @@ parser.add_argument('--nhid', type=int, default=1150,
                     help='number of hidden units per layer')
 parser.add_argument('--nlayers', type=int, default=3,
                     help='number of layers')
-parser.add_argument('--lr', type=float, default=30,
+parser.add_argument('--lr', type=float, default=20,
                     help='initial learning rate')
 parser.add_argument('--clip', type=float, default=0.25,
                     help='gradient clipping')
@@ -58,7 +57,7 @@ parser.add_argument('--weight_dropout', type=float, default=0.5,
                     help='weight dropout applied to h2h weight matrix (0 = no weight dropout)')
 parser.add_argument('--tied', action='store_true',
                     help='tie the word embedding and softmax weights')
-parser.add_argument('--log-interval', type=int, default=200, metavar='N',
+parser.add_argument('--log-interval', type=int, default=50, metavar='N',
                     help='report interval')
 parser.add_argument('--save', type=str, default='model.params',
                     help='path to save the final model')
@@ -71,7 +70,6 @@ parser.add_argument('--eval_only', action='store_true',
                     help='Whether to only evaluate the trained model')
 parser.add_argument('--gpus', type=str,
                     help='list of gpus to run, e.g. 0 or 0,2,5. empty means using cpu. (the result of multi-gpu training might be slightly different compared to single-gpu training, still need to be finalized)')
-parser.add_argument('--load', type=str, help='path to model to load')
 args = parser.parse_args()
 
 
@@ -104,8 +102,6 @@ class ElmoLSTM(gluon.Block):
             self.backward_layers = backward_layers
 
     def begin_state(self, *args, **kwargs):
-        print(args)
-        print(kwargs)
         return [forward_layer.begin_state(*args, **kwargs) for forward_layer in self.forward_layers], [backward_layer.begin_state(*args, **kwargs) for backward_layer in self.backward_layers]
 
     def forward(self, inputs, states_forward=None, states_backward=None):
@@ -127,13 +123,13 @@ class ElmoLSTM(gluon.Block):
                 outputs_forward[j].append(output)
             out_states_forward.append(states_forward[j])
 
-            outputs_backward.append([])
+            outputs_backward.append([None] * inputs.shape[0])
             for i in reversed(range(inputs.shape[0])):
                 if j == 0:
                     output, states_backward[j] = self.backward_layers[j](inputs[i], states_backward[j])
                 else:
                     output, states_backward[j] = self.backward_layers[j](outputs_backward[j-1][i], states_backward[j])
-                outputs_backward[j].append(output)
+                outputs_backward[j][i] = output
             out_states_backward.append(states_backward[j])
 
         for i in range(self.num_layers):
@@ -234,49 +230,24 @@ class StandardRNN(Block):
 context = [mx.cpu()] if args.gpus is None or args.gpus == "" else \
           [mx.gpu(int(i)) for i in args.gpus.split(',')]
 
-train_dataset = nlp.datasets.WikiText2(segment='train', seq_len=args.bptt,
-                                    eos='<eos>')
+args.batch_size *= len(context)
 
-def get_frequencies(dataset):
-    return nlp.data.Counter(x for tup in dataset for x in tup[0] if x)
+dataset_name = 'wikitext-2'
+train_dataset, val_dataset, test_dataset = [nlp.data.WikiText2(segment=segment,
+                                                               bos=None, eos='<eos>',
+                                                               skip_empty=False)
+                                            for segment in ['train', 'val', 'test']]
 
-vocab = nlp.Vocab(get_frequencies(train_dataset))
-def index_tokens(data, label):
-    return vocab[data], vocab[label]
+vocab = nlp.Vocab(nlp.data.Counter(train_dataset[0]), padding_token=None, bos_token=None)
 
-val_dataset, test_dataset = [nlp.datasets.WikiText2(segment=segment,
-                                                 seq_len=args.bptt,
-                                                 eos='<eos>')
-                             for segment in ['val', 'test']]
-
-nbatch_train = len(train_dataset) // args.batch_size
-train_data = gluon.data.DataLoader(train_dataset.transform(index_tokens),
-                                   batch_size=args.batch_size,
-                                   sampler=gluon.contrib.data.IntervalSampler(len(train_dataset),
-                                                                              nbatch_train),
-                                   last_batch='discard')
-
-nbatch_val = len(val_dataset) // args.batch_size
-val_data = gluon.data.DataLoader(val_dataset.transform(index_tokens),
-                                 batch_size=args.batch_size,
-                                 sampler=gluon.contrib.data.IntervalSampler(len(val_dataset),
-                                                                            nbatch_val),
-                                 last_batch='discard')
-
-nbatch_test = len(test_dataset) // args.batch_size
-test_data = gluon.data.DataLoader(test_dataset.transform(index_tokens),
-                                  batch_size=args.batch_size,
-                                  sampler=gluon.contrib.data.IntervalSampler(len(test_dataset),
-                                                                             nbatch_test),
-                                  last_batch='discard')
+train_data, val_data, test_data = [x.bptt_batchify(vocab, args.bptt, args.batch_size,
+                                                   last_batch='keep')
+                                   for x in [train_dataset, val_dataset, test_dataset]]
 
 
 ###############################################################################
 # Build the model
 ###############################################################################
-
-
-ntokens = len(vocab)
 
 if args.weight_dropout:
     model = AWDRNN(args.model, len(vocab), args.emsize, args.nhid, args.nlayers,
@@ -285,10 +256,7 @@ else:
     model = StandardRNN(args.model, len(vocab), args.emsize, args.nhid, args.nlayers,
                       args.tied, args.dropout)
 
-if args.load:
-    model.load_params(args.load)
-else:
-    model.initialize(mx.init.Xavier(), ctx=context)
+model.initialize(mx.init.Xavier(), ctx=context)
 
 
 compression_params = None if args.gctype == 'none' else {'type': args.gctype, 'threshold': args.gcthreshold}
@@ -312,18 +280,17 @@ def detach(hidden):
         hidden = hidden.detach()
     return hidden
 
-def eval(data_source):
+def evaluate(model, data_source, ctx):
     total_L = 0.0
     ntotal = 0
-    hidden = model.begin_state(batch_size=args.batch_size, func=mx.nd.zeros, ctx=context[0])
+    hidden = model.begin_state(batch_size=args.batch_size, func=mx.nd.zeros, ctx=ctx)
     for i, (data, target) in enumerate(data_source):
-        data = data.as_in_context(context[0]).T
-        target= target.as_in_context(context[0]).T
+        data = data.as_in_context(ctx)
+        target = target.as_in_context(ctx)
         output_tuple = model(data, *hidden)
         output = output_tuple[0]
         hidden = output_tuple[1:]
-        L = loss(mx.nd.reshape(output, (-3, -1)),
-                 mx.nd.reshape(target, (-1,)))
+        L = loss(mx.nd.reshape(output, (-3, -1)), mx.nd.reshape(target, (-1,)))
         total_L += mx.nd.sum(L).asscalar()
         ntotal += L.size
     return total_L / ntotal
@@ -338,72 +305,76 @@ def get_ppl(cur_loss):
 def train():
     best_val = float("Inf")
     start_train_time = time.time()
+    parameters = model.collect_params().values()
     for epoch in range(args.epochs):
-        total_L = 0.0
+        total_L, n_total = 0.0, 0
         start_epoch_time = time.time()
-        hiddens = [model.begin_state(batch_size=args.batch_size, func=mx.nd.zeros, ctx=ctx) for ctx in context]
+        start_log_interval_time = time.time()
+
+        hiddens = [model.begin_state(batch_size=args.batch_size//len(context), func=mx.nd.zeros, ctx=ctx) for ctx in context]
         for i, (data, target) in enumerate(train_data):
-            start_batch_time = time.time()
-            data = data.T
-            target= target.T
-            data_list = gluon.utils.split_and_load(data, context, even_split=False)
-            target_list = gluon.utils.split_and_load(target, context, even_split=False)
-            hiddens = [detach(hidden) for hidden in hiddens]
+            data_list = gluon.utils.split_and_load(data, context, batch_axis=1, even_split=True)
+            target_list = gluon.utils.split_and_load(target, context, batch_axis=1, even_split=True)
+            hiddens = detach(hiddens)
+            L = 0
             Ls = []
             with autograd.record():
                 for j, (X, y, h) in enumerate(zip(data_list, target_list, hiddens)):
                     output_tuple = model(X, *h)
                     output = output_tuple[0]
                     h = output_tuple[1:]
-                    Ls.append(loss(mx.nd.reshape(output, (-3, -1)), mx.nd.reshape(y, (-1,))))
+                    batch_L = loss(mx.nd.reshape(output, (-3, -1)), mx.nd.reshape(y, (-1,)))
+                    L = L + batch_L.as_in_context(context[0]) / X.size
+                    Ls.append(batch_L)
                     hiddens[j] = h
-            for L in Ls:
-                L.backward()
-            for ctx in context:
-                grads = [p.grad(ctx) for p in model.collect_params().values()]
-                gluon.utils.clip_global_norm(grads, args.clip * args.bptt * args.batch_size)
 
-            trainer.step(args.batch_size)
+            L.backward()
+            grads = [p.grad(x.context) for p in parameters for x in data_list]
+            gluon.utils.clip_global_norm(grads, args.clip)
 
-            total_L += sum([mx.nd.sum(L).asscalar() for L in Ls])
+            trainer.step(1)
+
+            total_L += sum([mx.nd.sum(l).asscalar() for l in Ls])
+            n_total += data.size
 
             if i % args.log_interval == 0 and i > 0:
-                cur_L = total_L / args.bptt / args.batch_size / args.log_interval
+                cur_L = total_L / n_total
                 ppl = get_ppl(cur_L)
-                print('[Epoch %d Batch %d] loss %.2f, ppl %.2f' % (
-                    epoch, i, cur_L, ppl))
-                total_L = 0.0
-
-            print('[Epoch %d Batch %d] throughput %.2f samples/s' % (
-                epoch, i, args.batch_size / (time.time() - start_batch_time)))
+                print('[Epoch %d Batch %d/%d] loss %.2f, ppl %.2f, throughput %.2f samples/s' % (
+                    epoch, i, len(train_data), cur_L, ppl, args.batch_size * args.log_interval / (time.time() - start_log_interval_time)))
+                total_L, n_total = 0.0, 0
+                start_log_interval_time = time.time()
 
         mx.nd.waitall()
 
         print('[Epoch %d] throughput %.2f samples/s' % (
-            epoch, (args.batch_size * nbatch_train) / (time.time() - start_epoch_time)))
-        val_L = eval(val_data)
+            epoch, (args.batch_size * len(train_data)) / (time.time() - start_epoch_time)))
+        val_L = evaluate(model, val_data, context[0])
         ppl = get_ppl(val_L)
         print('[Epoch %d] time cost %.2fs, valid loss %.2f, valid ppl %.2f' % (
             epoch, time.time() - start_epoch_time, val_L, ppl))
 
         if val_L < best_val:
             best_val = val_L
-            test_L = eval(test_data)
+            test_L = evaluate(model, test_data, context[0])
             model.collect_params().save(args.save)
             ppl = get_ppl(test_L)
             print('test loss %.2f, test ppl %.2f' % (test_L, ppl))
+        else:
+            args.lr = args.lr * 0.25
+            print('Learning rate now %f' % (args.lr))
+            trainer.set_learning_rate(args.lr)
 
     print('Total training throughput %.2f samples/s' % (
-            (args.batch_size * nbatch_train * args.epochs) / (time.time() - start_train_time)))
+            (args.batch_size * len(train_data) * args.epochs) / (time.time() - start_train_time)))
 
 if __name__ == '__main__':
     start_pipeline_time = time.time()
     if not args.eval_only:
         train()
     model.collect_params().load(args.save, context)
-    val_L = eval(val_data)
-    test_L = eval(test_data)
+    val_L = evaluate(model, val_data, context[0])
+    test_L = evaluate(model, test_data, context[0])
     print('Best validation loss %.2f, test ppl %.2f' % (val_L, math.exp(val_L)))
     print('Best test loss %.2f, test ppl %.2f' % (test_L, math.exp(test_L)))
     print('Total time cost %.2fs' % (time.time() - start_pipeline_time))
-
