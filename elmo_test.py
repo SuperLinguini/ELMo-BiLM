@@ -22,10 +22,10 @@ import math
 import mxnet as mx
 from mxnet import gluon, autograd, init, nd
 from mxnet.gluon import nn, Block
-from base import get_rnn_cell
 # from mxnet.gluon import data, text
 
 import gluonnlp as nlp
+from gluonnlp.model.utils import _get_rnn_cell
 # from gluonnlp.models.language_model import StandardRNN, AWDRNN
 
 parser = argparse.ArgumentParser(description='MXNet Autograd RNN/LSTM Language Model on Wikitext-2.')
@@ -53,7 +53,7 @@ parser.add_argument('--dropout_h', type=float, default=0.3,
                     help='dropout applied to hidden layer (0 = no dropout)')
 parser.add_argument('--dropout_i', type=float, default=0.65,
                     help='dropout applied to input layer (0 = no dropout)')
-parser.add_argument('--weight_dropout', type=float, default=0.5,
+parser.add_argument('--weight_dropout', type=float, default=0,
                     help='weight dropout applied to h2h weight matrix (0 = no weight dropout)')
 parser.add_argument('--tied', action='store_true',
                     help='tie the word embedding and softmax weights')
@@ -88,8 +88,8 @@ class ElmoLSTM(gluon.Block):
 
         with self.name_scope():
             for layer_index in range(num_layers):
-                forward_layer = get_rnn_cell(mode, 1, lstm_input_size, hidden_size, dropout, weight_dropout)
-                backward_layer = get_rnn_cell(mode, 1, lstm_input_size, hidden_size, dropout, weight_dropout)
+                forward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, dropout, weight_dropout, 0, 0, 0)
+                backward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, dropout, weight_dropout, 0, 0, 0)
 
                 self.register_child(forward_layer)
                 self.register_child(backward_layer)
@@ -138,6 +138,10 @@ class ElmoLSTM(gluon.Block):
 
         return outputs_forward, out_states_forward, outputs_backward, out_states_backward
 
+# elmo = ElmoLSTM('lstm', 1, 3, 5, 0, 0)
+# inputs = mx.nd.ones((5,4,3))
+# elmo.collect_params().initialize()
+# outputs_forward, out_states_forward, outputs_backward, out_states_backward = elmo(inputs)
 
 class StandardRNN(Block):
     """Standard RNN language model.
@@ -307,7 +311,7 @@ def train():
     start_train_time = time.time()
     parameters = model.collect_params().values()
     for epoch in range(args.epochs):
-        total_L, n_total = 0.0, 0
+        total_L = 0.0
         start_epoch_time = time.time()
         start_log_interval_time = time.time()
 
@@ -325,7 +329,7 @@ def train():
                     h = output_tuple[1:]
                     batch_L = loss(mx.nd.reshape(output, (-3, -1)), mx.nd.reshape(y, (-1,)))
                     L = L + batch_L.as_in_context(context[0]) / X.size
-                    Ls.append(batch_L)
+                    Ls.append(batch_L / X.size)
                     hiddens[j] = h
 
             L.backward()
@@ -335,14 +339,13 @@ def train():
             trainer.step(1)
 
             total_L += sum([mx.nd.sum(l).asscalar() for l in Ls])
-            n_total += data.size
 
             if i % args.log_interval == 0 and i > 0:
-                cur_L = total_L / n_total
+                cur_L = total_L / args.log_interval
                 ppl = get_ppl(cur_L)
                 print('[Epoch %d Batch %d/%d] loss %.2f, ppl %.2f, throughput %.2f samples/s' % (
                     epoch, i, len(train_data), cur_L, ppl, args.batch_size * args.log_interval / (time.time() - start_log_interval_time)))
-                total_L, n_total = 0.0, 0
+                total_L = 0.0
                 start_log_interval_time = time.time()
 
         mx.nd.waitall()
