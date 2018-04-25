@@ -18,11 +18,13 @@
 import argparse
 import collections
 import time
+import json
 import math
 import mxnet as mx
 from mxnet import gluon, autograd, init, nd
 from mxnet.gluon import nn, Block
-# from mxnet.gluon import data, text
+
+from ELMo.data import UnicodeCharsVocabulary, WikiText2Character
 
 import gluonnlp as nlp
 from gluonnlp.model.utils import _get_rnn_cell
@@ -141,7 +143,7 @@ class ElmoLSTM(gluon.Block):
 
         return outputs_forward, out_states_forward, outputs_backward, out_states_backward
 
-class StandardRNN(Block):
+class StandardRNN(gluon.Block):
     """Standard RNN language model.
 
     Parameters
@@ -237,16 +239,15 @@ context = [mx.cpu()] if args.gpus is None or args.gpus == "" else \
 
 args.batch_size *= len(context)
 
-dataset_name = 'wikitext-2'
-train_dataset, val_dataset, test_dataset = [nlp.data.WikiText2(segment=segment,
+train_dataset, val_dataset, test_dataset = [WikiText2Character(segment=segment,
                                                                bos=None, eos='<eos>',
                                                                skip_empty=False)
                                             for segment in ['train', 'val', 'test']]
 
-vocab = nlp.Vocab(nlp.data.Counter(train_dataset[0]), padding_token=None, bos_token=None)
+vocab = UnicodeCharsVocabulary(nlp.data.Counter(train_dataset[0]), 50)
 
 train_data, val_data, test_data = [x.bptt_batchify(vocab, args.bptt, args.batch_size,
-                                                   last_batch='keep')
+                                                   last_batch='keep', load_path='train_data' if x is train_dataset else None)
                                    for x in [train_dataset, val_dataset, test_dataset]]
 
 
