@@ -22,20 +22,20 @@ import math
 import mxnet as mx
 from mxnet import gluon, autograd, init, nd
 from mxnet.gluon import nn, Block
-from base import get_rnn_cell
 # from mxnet.gluon import data, text
 
 import gluonnlp as nlp
+from gluonnlp.model.utils import _get_rnn_cell
 # from gluonnlp.models.language_model import StandardRNN, AWDRNN
 
 parser = argparse.ArgumentParser(description='MXNet Autograd RNN/LSTM Language Model on Wikitext-2.')
 parser.add_argument('--model', type=str, default='lstm',
                     help='type of recurrent net (rnn_tanh, rnn_relu, lstm, gru)')
-parser.add_argument('--emsize', type=int, default=400,
+parser.add_argument('--emsize', type=int, default=200,
                     help='size of word embeddings')
-parser.add_argument('--nhid', type=int, default=1150,
+parser.add_argument('--nhid', type=int, default=1200,
                     help='number of hidden units per layer')
-parser.add_argument('--nlayers', type=int, default=3,
+parser.add_argument('--nlayers', type=int, default=2,
                     help='number of layers')
 parser.add_argument('--lr', type=float, default=20,
                     help='initial learning rate')
@@ -53,7 +53,7 @@ parser.add_argument('--dropout_h', type=float, default=0.3,
                     help='dropout applied to hidden layer (0 = no dropout)')
 parser.add_argument('--dropout_i', type=float, default=0.65,
                     help='dropout applied to input layer (0 = no dropout)')
-parser.add_argument('--weight_dropout', type=float, default=0.5,
+parser.add_argument('--weight_dropout', type=float, default=0,
                     help='weight dropout applied to h2h weight matrix (0 = no weight dropout)')
 parser.add_argument('--tied', action='store_true',
                     help='tie the word embedding and softmax weights')
@@ -88,8 +88,8 @@ class ElmoLSTM(gluon.Block):
 
         with self.name_scope():
             for layer_index in range(num_layers):
-                forward_layer = get_rnn_cell(mode, 1, lstm_input_size, hidden_size, dropout, weight_dropout)
-                backward_layer = get_rnn_cell(mode, 1, lstm_input_size, hidden_size, dropout, weight_dropout)
+                forward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, dropout, weight_dropout, 0, 0, 0)
+                backward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, dropout, weight_dropout, 0, 0, 0)
 
                 self.register_child(forward_layer)
                 self.register_child(backward_layer)
@@ -104,9 +104,12 @@ class ElmoLSTM(gluon.Block):
     def begin_state(self, *args, **kwargs):
         return [forward_layer.begin_state(*args, **kwargs) for forward_layer in self.forward_layers], [backward_layer.begin_state(*args, **kwargs) for backward_layer in self.backward_layers]
 
-    def forward(self, inputs, states_forward=None, states_backward=None):
+    def forward(self, inputs_forward, inputs_backward, states_forward=None, states_backward=None):
+        seq_len = inputs_forward.shape[0]
+        batch_size = inputs_forward.shape[1]
+
         if not (states_forward and states_backward):
-            states_forward, states_backward = self.begin_state(batch_size=inputs.shape[1])
+            states_forward, states_backward = self.begin_state(batch_size=batch_size)
 
         outputs_forward = []
         out_states_forward = []
@@ -115,18 +118,18 @@ class ElmoLSTM(gluon.Block):
 
         for j in range(self.num_layers):
             outputs_forward.append([])
-            for i in range(inputs.shape[0]):
+            for i in range(seq_len):
                 if j == 0:
-                    output, states_forward[j] = self.forward_layers[j](inputs[i], states_forward[j])
+                    output, states_forward[j] = self.forward_layers[j](inputs_forward[i], states_forward[j])
                 else:
                     output, states_forward[j] = self.forward_layers[j](outputs_forward[j-1][i], states_forward[j])
                 outputs_forward[j].append(output)
             out_states_forward.append(states_forward[j])
 
-            outputs_backward.append([None] * inputs.shape[0])
-            for i in reversed(range(inputs.shape[0])):
+            outputs_backward.append([None] * seq_len)
+            for i in reversed(range(seq_len)):
                 if j == 0:
-                    output, states_backward[j] = self.backward_layers[j](inputs[i], states_backward[j])
+                    output, states_backward[j] = self.backward_layers[j](inputs_backward[i], states_backward[j])
                 else:
                     output, states_backward[j] = self.backward_layers[j](outputs_backward[j-1][i], states_backward[j])
                 outputs_backward[j][i] = output
@@ -137,7 +140,6 @@ class ElmoLSTM(gluon.Block):
             outputs_backward[i] = mx.nd.stack(*outputs_backward[i])
 
         return outputs_forward, out_states_forward, outputs_backward, out_states_backward
-
 
 class StandardRNN(Block):
     """Standard RNN language model.
@@ -191,7 +193,7 @@ class StandardRNN(Block):
 
     def _get_encoder(self):
         return ElmoLSTM(self._mode, self._num_layers, self._embed_size,
-                              self._hidden_size, self._dropout, 0)
+                              self._hidden_size // 2, self._dropout, 0)
 
     def _get_decoder(self):
         output = nn.HybridSequential()
@@ -207,11 +209,13 @@ class StandardRNN(Block):
     def begin_state(self, *args, **kwargs):
         return self.encoder.begin_state(*args, **kwargs)
 
-    def forward(self, inputs, states_forward=None, states_backward=None): # pylint: disable=arguments-differ
-        embedded_inputs = self.embedding(inputs)
+    def forward(self, inputs_forward, inputs_backward, states_forward=None, states_backward=None): # pylint: disable=arguments-differ
+        forward_embedded_inputs = self.embedding(inputs_forward)
+        backward_embedded_inputs = self.embedding(inputs_backward)
+
         if not (states_forward and states_backward):
-            states_forward, states_backward = self.begin_state(batch_size=inputs.shape[1])
-        outputs_forward, out_states_forward, outputs_backward, out_states_backward = self.encoder(embedded_inputs, states_forward, states_backward)
+            states_forward, states_backward = self.begin_state(batch_size=inputs_forward.shape[1])
+        outputs_forward, out_states_forward, outputs_backward, out_states_backward = self.encoder(forward_embedded_inputs, backward_embedded_inputs, states_forward, states_backward)
 
         # out2 = mx.nd.empty((len(outputs_forward[-1]), outputs_forward[-1][0].shape[0], self._vocab_size))
         # out = []
@@ -219,8 +223,9 @@ class StandardRNN(Block):
         #     # out[i, :, :] = self.decoder(mx.nd.concat(outputs_forward[-1][0], outputs_backward[-1][0], dim=1))
         #     out.append(self.decoder(mx.nd.concat(outputs_forward[-1][0], outputs_backward[-1][0], dim=1)))
         # out2 = mx.nd.stack(*out)
-        out = self.decoder(mx.nd.concat(outputs_forward[-1], outputs_backward[-1], dim=2))
-        return out, states_forward, states_backward
+        forward_out = self.decoder(outputs_forward[-1])
+        backward_out = self.decoder(outputs_backward[-1])
+        return (forward_out, backward_out), (states_forward, states_backward)
 
 
 ###############################################################################
@@ -287,11 +292,13 @@ def evaluate(model, data_source, ctx):
     for i, (data, target) in enumerate(data_source):
         data = data.as_in_context(ctx)
         target = target.as_in_context(ctx)
-        output_tuple = model(data, *hidden)
-        output = output_tuple[0]
-        hidden = output_tuple[1:]
-        L = loss(mx.nd.reshape(output, (-3, -1)), mx.nd.reshape(target, (-1,)))
+        output, h = model(data, target, *hidden)
+        L = loss(mx.nd.reshape(output[0], (-3, -1)), mx.nd.reshape(target, (-1,)))
         total_L += mx.nd.sum(L).asscalar()
+
+        L = loss(mx.nd.reshape(output[1], (-3, -1)), mx.nd.reshape(data, (-1,)))
+        total_L += mx.nd.sum(L).asscalar()
+
         ntotal += L.size
     return total_L / ntotal
 
@@ -307,7 +314,7 @@ def train():
     start_train_time = time.time()
     parameters = model.collect_params().values()
     for epoch in range(args.epochs):
-        total_L, n_total = 0.0, 0
+        total_L = 0.0
         start_epoch_time = time.time()
         start_log_interval_time = time.time()
 
@@ -316,16 +323,19 @@ def train():
             data_list = gluon.utils.split_and_load(data, context, batch_axis=1, even_split=True)
             target_list = gluon.utils.split_and_load(target, context, batch_axis=1, even_split=True)
             hiddens = detach(hiddens)
+
             L = 0
             Ls = []
             with autograd.record():
                 for j, (X, y, h) in enumerate(zip(data_list, target_list, hiddens)):
-                    output_tuple = model(X, *h)
-                    output = output_tuple[0]
-                    h = output_tuple[1:]
-                    batch_L = loss(mx.nd.reshape(output, (-3, -1)), mx.nd.reshape(y, (-1,)))
+                    output, h = model(X, y, *h)
+                    batch_L = loss(mx.nd.reshape(output[0], (-3, -1)), mx.nd.reshape(y, (-1,)))
                     L = L + batch_L.as_in_context(context[0]) / X.size
-                    Ls.append(batch_L)
+                    Ls.append(batch_L / X.size)
+
+                    batch_L = loss(mx.nd.reshape(output[1], (-3, -1)), mx.nd.reshape(X, (-1,)))
+                    L = L + batch_L.as_in_context(context[0]) / X.size
+                    Ls.append(batch_L / X.size)
                     hiddens[j] = h
 
             L.backward()
@@ -335,28 +345,27 @@ def train():
             trainer.step(1)
 
             total_L += sum([mx.nd.sum(l).asscalar() for l in Ls])
-            n_total += data.size
 
             if i % args.log_interval == 0 and i > 0:
-                cur_L = total_L / n_total
-                ppl = get_ppl(cur_L)
+                cur_L = total_L / (args.log_interval * 2)
                 print('[Epoch %d Batch %d/%d] loss %.2f, ppl %.2f, throughput %.2f samples/s' % (
-                    epoch, i, len(train_data), cur_L, ppl, args.batch_size * args.log_interval / (time.time() - start_log_interval_time)))
-                total_L, n_total = 0.0, 0
+                    epoch, i, len(train_data), cur_L, math.exp(cur_L),
+                    args.batch_size * args.log_interval / (time.time() - start_log_interval_time)))
+                total_L = 0.0
                 start_log_interval_time = time.time()
 
         mx.nd.waitall()
 
         print('[Epoch %d] throughput %.2f samples/s' % (
             epoch, (args.batch_size * len(train_data)) / (time.time() - start_epoch_time)))
-        val_L = evaluate(model, val_data, context[0])
+        val_L = evaluate(model, val_data, context[0]) / 2
         ppl = get_ppl(val_L)
         print('[Epoch %d] time cost %.2fs, valid loss %.2f, valid ppl %.2f' % (
             epoch, time.time() - start_epoch_time, val_L, ppl))
 
         if val_L < best_val:
             best_val = val_L
-            test_L = evaluate(model, test_data, context[0])
+            test_L = evaluate(model, test_data, context[0]) / 2
             model.collect_params().save(args.save)
             ppl = get_ppl(test_L)
             print('test loss %.2f, test ppl %.2f' % (test_L, ppl))
@@ -373,8 +382,8 @@ if __name__ == '__main__':
     if not args.eval_only:
         train()
     model.collect_params().load(args.save, context)
-    val_L = evaluate(model, val_data, context[0])
-    test_L = evaluate(model, test_data, context[0])
+    val_L = evaluate(model, val_data, context[0]) / 2
+    test_L = evaluate(model, test_data, context[0]) / 2
     print('Best validation loss %.2f, test ppl %.2f' % (val_L, math.exp(val_L)))
     print('Best test loss %.2f, test ppl %.2f' % (test_L, math.exp(test_L)))
     print('Total time cost %.2fs' % (time.time() - start_pipeline_time))
