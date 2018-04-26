@@ -25,6 +25,7 @@ from mxnet import gluon, autograd, init, nd
 from mxnet.gluon import nn, Block
 
 from ELMo.data import UnicodeCharsVocabulary, WikiText2Character
+from ELMo.elmo_char_encoder import ElmoCharacterEncoder
 
 import gluonnlp as nlp
 from gluonnlp.model.utils import _get_rnn_cell
@@ -74,7 +75,26 @@ parser.add_argument('--gpus', type=str,
                     help='list of gpus to run, e.g. 0 or 0,2,5. empty means using cpu. (the result of multi-gpu training might be slightly different compared to single-gpu training, still need to be finalized)')
 args = parser.parse_args()
 
-
+options = {
+  "lstm": {
+    "use_skip_connections": True,
+    "projection_dim": 512,
+    "cell_clip": 3,
+    "proj_clip": 3,
+    "dim": 4096,
+    "n_layers": 2
+  },
+  "char_cnn": {
+    "activation": "relu",
+    "filters": [[1, 32], [2, 32], [3, 64], [4, 128], [5, 256], [6, 512], [7, 1024]],
+    "n_highway": 2,
+    "embedding": {
+      "dim": 16
+    },
+    "n_characters": 262,
+    "max_characters_per_token": 50
+  }
+}
 
 
 class ElmoLSTM(gluon.Block):
@@ -185,13 +205,7 @@ class StandardRNN(gluon.Block):
             self.decoder = self._get_decoder()
 
     def _get_embedding(self):
-        embedding = nn.HybridSequential()
-        with embedding.name_scope():
-            embedding.add(nn.Embedding(self._vocab_size, self._embed_size,
-                                       weight_initializer=init.Uniform(0.1)))
-            if self._dropout:
-                embedding.add(nn.Dropout(self._dropout))
-        return embedding
+        return ElmoCharacterEncoder(options)
 
     def _get_encoder(self):
         return ElmoLSTM(self._mode, self._num_layers, self._embed_size,
@@ -259,7 +273,7 @@ if args.weight_dropout:
     model = AWDRNN(args.model, len(vocab), args.emsize, args.nhid, args.nlayers,
                    args.tied, args.dropout, args.weight_dropout, args.dropout_h, args.dropout_i)
 else:
-    model = StandardRNN(args.model, len(vocab), args.emsize, args.nhid, args.nlayers,
+    model = StandardRNN(args.model, len(vocab), options['lstm']['projection_dim'], args.nhid, args.nlayers,
                       args.tied, args.dropout)
 
 model.initialize(mx.init.Xavier(), ctx=context)
