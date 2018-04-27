@@ -16,16 +16,14 @@
 # under the License.
 
 import argparse
-import collections
 import time
-import json
 import math
 import mxnet as mx
 from mxnet import gluon, autograd, init, nd
-from mxnet.gluon import nn, Block
+from mxnet.gluon import nn
 
-from ELMo.data import UnicodeCharsVocabulary, WikiText2Character
-from ELMo.elmo_char_encoder import ElmoCharacterEncoder
+from data import UnicodeCharsVocabulary, WikiText2Character
+from elmo_char_encoder import ElmoCharacterEncoder
 
 import gluonnlp as nlp
 from gluonnlp.model.utils import _get_rnn_cell
@@ -40,11 +38,11 @@ parser.add_argument('--nhid', type=int, default=1200,
                     help='number of hidden units per layer')
 parser.add_argument('--nlayers', type=int, default=2,
                     help='number of layers')
-parser.add_argument('--lr', type=float, default=20,
+parser.add_argument('--lr', type=float, default=1.0,
                     help='initial learning rate')
 parser.add_argument('--clip', type=float, default=0.25,
                     help='gradient clipping')
-parser.add_argument('--epochs', type=int, default=750,
+parser.add_argument('--epochs', type=int, default=200,
                     help='upper epoch limit')
 parser.add_argument('--batch_size', type=int, default=80, metavar='N',
                     help='batch size')
@@ -52,7 +50,7 @@ parser.add_argument('--bptt', type=int, default=35,
                     help='sequence length')
 parser.add_argument('--dropout', type=float, default=0.4,
                     help='dropout applied to layers (0 = no dropout)')
-parser.add_argument('--dropout_h', type=float, default=0.3,
+parser.add_argument('--dropout_h', type=float, default=0.2,
                     help='dropout applied to hidden layer (0 = no dropout)')
 parser.add_argument('--dropout_i', type=float, default=0.65,
                     help='dropout applied to input layer (0 = no dropout)')
@@ -248,21 +246,31 @@ class StandardRNN(gluon.Block):
 # Load data
 ###############################################################################
 
-context = [mx.cpu()] if args.gpus is None or args.gpus == "" else \
+context = [mx.cpu()] if args.gpus is None or args.gpus == '' else \
           [mx.gpu(int(i)) for i in args.gpus.split(',')]
 
-args.batch_size *= len(context)
+assert args.batch_size % len(context) == 0, \
+    'Total batch size must be multiple of the number of devices'
 
 train_dataset, val_dataset, test_dataset = [WikiText2Character(segment=segment,
-                                                               bos=None, eos='<eos>',
+                                                               bos='<bos>', eos='<eos>',
                                                                skip_empty=False)
                                             for segment in ['train', 'val', 'test']]
 
-vocab = UnicodeCharsVocabulary(nlp.data.Counter(train_dataset[0]), 50)
+max_word_length = 50
 
-train_data, val_data, test_data = [x.bptt_batchify(vocab, args.bptt, args.batch_size,
-                                                   last_batch='keep', load_path='train_data' if x is train_dataset else None)
+vocab = UnicodeCharsVocabulary(nlp.data.Counter(train_dataset[0]), max_word_length)
+
+train_data, val_data, test_data = [x.batchify(vocab, args.batch_size, max_word_length, load='train_data' if x is train_dataset else None)
                                    for x in [train_dataset, val_dataset, test_dataset]]
+
+def get_batch(data_source, i, seq_len=None):
+    seq_len = min(seq_len if seq_len else args.bptt, len(data_source[0]) - 1 - i)
+    forward_data = data_source[0][i:i+seq_len]
+    backward_data = data_source[0][i+1:i+1+seq_len]
+    forward_target = data_source[1][i+1:i+1+seq_len]
+    backward_target = data_source[1][i:i+seq_len]
+    return (forward_data, backward_data), (forward_target, backward_target)
 
 
 ###############################################################################
@@ -276,7 +284,7 @@ else:
     model = StandardRNN(args.model, len(vocab), options['lstm']['projection_dim'], args.nhid, args.nlayers,
                       args.tied, args.dropout)
 
-model.initialize(mx.init.Xavier(), ctx=context)
+model.initialize(init.Xavier(), ctx=context)
 
 
 compression_params = None if args.gctype == 'none' else {'type': args.gctype, 'threshold': args.gcthreshold}
@@ -304,14 +312,15 @@ def evaluate(model, data_source, ctx):
     total_L = 0.0
     ntotal = 0
     hidden = model.begin_state(batch_size=args.batch_size, func=mx.nd.zeros, ctx=ctx)
-    for i, (data, target) in enumerate(data_source):
-        data = data.as_in_context(ctx)
-        target = target.as_in_context(ctx)
-        output, h = model(data, target, *hidden)
-        L = loss(mx.nd.reshape(output[0], (-3, -1)), mx.nd.reshape(target, (-1,)))
+    for i in range(0, len(data_source[0]) - 1, args.bptt):
+        data, target = get_batch(data_source, i)
+        data = data[0].as_in_context(ctx), data[1].as_in_context(ctx)
+        target = target[0].as_in_context(ctx), target[1].as_in_context(ctx)
+        output, h = model(data[0], data[1], *hidden)
+        L = loss(mx.nd.reshape(output[0], (-3, -1)), mx.nd.reshape(target[0], (-1,)))
         total_L += mx.nd.sum(L).asscalar()
 
-        L = loss(mx.nd.reshape(output[1], (-3, -1)), mx.nd.reshape(data, (-1,)))
+        L = loss(mx.nd.reshape(output[1], (-3, -1)), mx.nd.reshape(target[1], (-1,)))
         total_L += mx.nd.sum(L).asscalar()
 
         ntotal += L.size
@@ -334,45 +343,53 @@ def train():
         start_log_interval_time = time.time()
 
         hiddens = [model.begin_state(batch_size=args.batch_size//len(context), func=mx.nd.zeros, ctx=ctx) for ctx in context]
-        for i, (data, target) in enumerate(train_data):
-            data_list = gluon.utils.split_and_load(data, context, batch_axis=1, even_split=True)
-            target_list = gluon.utils.split_and_load(target, context, batch_axis=1, even_split=True)
+
+        batch_i, i = 0, 0
+        while i < len(train_data[0]) - 1 - 1:
+            data, target = get_batch(train_data, i, seq_len=args.bptt)
+
+            forward_data_list = gluon.utils.split_and_load(data[0], context, batch_axis=1, even_split=True)
+            backward_data_list = gluon.utils.split_and_load(data[1], context, batch_axis=1, even_split=True)
+            forward_target_list = gluon.utils.split_and_load(target[0], context, batch_axis=1, even_split=True)
+            backward_target_list = gluon.utils.split_and_load(target[1], context, batch_axis=1, even_split=True)
             hiddens = detach(hiddens)
 
             L = 0
             Ls = []
             with autograd.record():
-                for j, (X, y, h) in enumerate(zip(data_list, target_list, hiddens)):
-                    output, h = model(X, y, *h)
-                    batch_L = loss(mx.nd.reshape(output[0], (-3, -1)), mx.nd.reshape(y, (-1,)))
-                    L = L + batch_L.as_in_context(context[0]) / X.size
-                    Ls.append(batch_L / X.size)
+                for j, (X_forward, X_backward, y_forward, y_backward, h) in enumerate(zip(forward_data_list, backward_data_list, forward_target_list, backward_target_list, hiddens)):
+                    output, h = model(X_forward, X_backward, *h)
+                    batch_L = loss(mx.nd.reshape(output[0], (-3, -1)), mx.nd.reshape(y_forward, (-1,)))
+                    L = L + batch_L.as_in_context(context[0]) / y_forward.size
+                    Ls.append(batch_L / y_forward.size)
 
-                    batch_L = loss(mx.nd.reshape(output[1], (-3, -1)), mx.nd.reshape(X, (-1,)))
-                    L = L + batch_L.as_in_context(context[0]) / X.size
-                    Ls.append(batch_L / X.size)
+                    batch_L = loss(mx.nd.reshape(output[1], (-3, -1)), mx.nd.reshape(y_backward, (-1,)))
+                    L = L + batch_L.as_in_context(context[0]) / y_forward.size
+                    Ls.append(batch_L / y_forward.size)
                     hiddens[j] = h
 
             L.backward()
-            grads = [p.grad(x.context) for p in parameters for x in data_list]
+            grads = [p.grad(x.context) for p in parameters for x in forward_data_list]
             gluon.utils.clip_global_norm(grads, args.clip)
 
             trainer.step(1)
 
             total_L += sum([mx.nd.sum(l).asscalar() for l in Ls])
 
-            if i % args.log_interval == 0 and i > 0:
+            if batch_i % args.log_interval == 0 and batch_i > 0:
                 cur_L = total_L / (args.log_interval * 2)
-                print('[Epoch %d Batch %d/%d] loss %.2f, ppl %.2f, throughput %.2f samples/s' % (
-                    epoch, i, len(train_data), cur_L, math.exp(cur_L),
-                    args.batch_size * args.log_interval / (time.time() - start_log_interval_time)))
+                print('[Epoch %d Batch %d/%d] loss %.2f, ppl %.2f, throughput %.2f samples/s, lr %.2f' % (
+                    epoch, batch_i, len(train_data[0]) // args.bptt, cur_L, math.exp(cur_L),
+                    args.batch_size * args.log_interval / (time.time() - start_log_interval_time), args.lr))
                 total_L = 0.0
                 start_log_interval_time = time.time()
+            i += args.bptt
+            batch_i += 1
 
         mx.nd.waitall()
 
         print('[Epoch %d] throughput %.2f samples/s' % (
-            epoch, (args.batch_size * len(train_data)) / (time.time() - start_epoch_time)))
+            epoch, (args.batch_size * len(train_data[0])) / (time.time() - start_epoch_time)))
         val_L = evaluate(model, val_data, context[0]) / 2
         ppl = get_ppl(val_L)
         print('[Epoch %d] time cost %.2fs, valid loss %.2f, valid ppl %.2f' % (
@@ -390,7 +407,7 @@ def train():
             trainer.set_learning_rate(args.lr)
 
     print('Total training throughput %.2f samples/s' % (
-            (args.batch_size * len(train_data) * args.epochs) / (time.time() - start_train_time)))
+            (args.batch_size * len(train_data[0]) * args.epochs) / (time.time() - start_train_time)))
 
 if __name__ == '__main__':
     start_pipeline_time = time.time()

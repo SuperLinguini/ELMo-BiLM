@@ -1,17 +1,8 @@
-import argparse
-import collections
-import time
 import json
-import math
-import mxnet as mx
 from mxnet import gluon, autograd, init, nd
 from mxnet.ndarray.ndarray import NDArray
 from mxnet.gluon import nn, Block
 from overrides import overrides
-from ELMo.data import UnicodeCharsVocabulary, WikiText2Character
-
-import gluonnlp as nlp
-from gluonnlp.model.utils import _get_rnn_cell
 
 options = {
   "lstm": {
@@ -120,9 +111,8 @@ class ElmoCharacterEncoder(gluon.Block):
             convolutions = []
             for i, (width, out_channels) in enumerate(filters):
                 conv = nn.Conv1D(in_channels=char_embed_dim, channels=out_channels, kernel_size=width, use_bias=True)
-                convolutions.append(conv)
                 setattr(self, 'char_conv_{}'.format(i), conv)
-            self.convolutions = convolutions
+            self.num_filters = len(filters)
 
             self.highways = Highway(n_filters, n_highway, activation=nn.Activation('relu'))
 
@@ -145,7 +135,7 @@ class ElmoCharacterEncoder(gluon.Block):
         # (batch_size * sequence_length, embed_dim, max_chars_per_token)
         character_embedding = nd.swapaxes(character_embedding, 1, 2)
         convs = []
-        for i in range(len(self.convolutions)):
+        for i in range(self.num_filters):
             conv = getattr(self, 'char_conv_{}'.format(i))
             convolved = conv(character_embedding)
             # (batch_size * sequence_length, n_filters for this width)
@@ -162,14 +152,13 @@ class ElmoCharacterEncoder(gluon.Block):
         # final projection  (batch_size * sequence_length, embedding_dim)
         token_embedding = self.projection(token_embedding)
 
-        # reshape to (batch_size, sequence_length, embedding_dim)
-        batch_size, sequence_length, _ = inputs.shape
+        # reshape to (sequence_length, batch_size, embedding_dim)
+        sequence_length, batch_size, _ = inputs.shape
 
-        return token_embedding.reshape(batch_size, sequence_length, -1)
+        return token_embedding.reshape(sequence_length, batch_size, -1)
 
 # # cnn = ElmoCharacterEncoder(options, 'https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5', True)
 # cnn = ElmoCharacterEncoder(options)
 # cnn.collect_params().initialize()
 # train_data = mx.nd.load('data')
 # output = cnn(train_data)
-# print('hello')
