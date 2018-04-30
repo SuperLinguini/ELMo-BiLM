@@ -23,10 +23,9 @@ from mxnet import gluon, autograd, init, nd
 from mxnet.gluon import nn
 
 from data import UnicodeCharsVocabulary, WikiText2Character
-from elmo_char_encoder import ElmoCharacterEncoder
+from model import ElmoBiLM, elmo_options as options
 
 import gluonnlp as nlp
-from gluonnlp.model.utils import _get_rnn_cell
 # from gluonnlp.models.language_model import StandardRNN, AWDRNN
 
 parser = argparse.ArgumentParser(description='MXNet Autograd RNN/LSTM Language Model on Wikitext-2.')
@@ -73,175 +72,6 @@ parser.add_argument('--gpus', type=str,
                     help='list of gpus to run, e.g. 0 or 0,2,5. empty means using cpu. (the result of multi-gpu training might be slightly different compared to single-gpu training, still need to be finalized)')
 args = parser.parse_args()
 
-options = {
-  "lstm": {
-    "use_skip_connections": True,
-    "projection_dim": 512,
-    "cell_clip": 3,
-    "proj_clip": 3,
-    "dim": 4096,
-    "n_layers": 2
-  },
-  "char_cnn": {
-    "activation": "relu",
-    "filters": [[1, 32], [2, 32], [3, 64], [4, 128], [5, 256], [6, 512], [7, 1024]],
-    "n_highway": 2,
-    "embedding": {
-      "dim": 16
-    },
-    "n_characters": 262,
-    "max_characters_per_token": 50
-  }
-}
-
-
-class ElmoLSTM(gluon.Block):
-    def __init__(self, mode, num_layers, input_size, hidden_size, dropout, weight_dropout, bidirectional=True):
-        super(ElmoLSTM, self).__init__()
-
-        self.num_layers = num_layers
-
-        forward_layers = []
-        backward_layers = []
-
-        lstm_input_size = input_size
-
-        with self.name_scope():
-            for layer_index in range(num_layers):
-                forward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, dropout, weight_dropout, 0, 0, 0)
-                backward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, dropout, weight_dropout, 0, 0, 0)
-
-                self.register_child(forward_layer)
-                self.register_child(backward_layer)
-
-                forward_layers.append(forward_layer)
-                backward_layers.append(backward_layer)
-
-                lstm_input_size = hidden_size
-            self.forward_layers = forward_layers
-            self.backward_layers = backward_layers
-
-    def begin_state(self, *args, **kwargs):
-        return [forward_layer.begin_state(*args, **kwargs) for forward_layer in self.forward_layers], [backward_layer.begin_state(*args, **kwargs) for backward_layer in self.backward_layers]
-
-    def forward(self, inputs_forward, inputs_backward, states_forward=None, states_backward=None):
-        seq_len = inputs_forward.shape[0]
-        batch_size = inputs_forward.shape[1]
-
-        if not (states_forward and states_backward):
-            states_forward, states_backward = self.begin_state(batch_size=batch_size)
-
-        outputs_forward = []
-        out_states_forward = []
-        outputs_backward = []
-        out_states_backward = []
-
-        for j in range(self.num_layers):
-            outputs_forward.append([])
-            for i in range(seq_len):
-                if j == 0:
-                    output, states_forward[j] = self.forward_layers[j](inputs_forward[i], states_forward[j])
-                else:
-                    output, states_forward[j] = self.forward_layers[j](outputs_forward[j-1][i], states_forward[j])
-                outputs_forward[j].append(output)
-            out_states_forward.append(states_forward[j])
-
-            outputs_backward.append([None] * seq_len)
-            for i in reversed(range(seq_len)):
-                if j == 0:
-                    output, states_backward[j] = self.backward_layers[j](inputs_backward[i], states_backward[j])
-                else:
-                    output, states_backward[j] = self.backward_layers[j](outputs_backward[j-1][i], states_backward[j])
-                outputs_backward[j][i] = output
-            out_states_backward.append(states_backward[j])
-
-        for i in range(self.num_layers):
-            outputs_forward[i] = mx.nd.stack(*outputs_forward[i])
-            outputs_backward[i] = mx.nd.stack(*outputs_backward[i])
-
-        return outputs_forward, out_states_forward, outputs_backward, out_states_backward
-
-class StandardRNN(gluon.Block):
-    """Standard RNN language model.
-
-    Parameters
-    ----------
-    mode : str
-        The type of RNN to use. Options are 'lstm', 'gru', 'rnn_tanh', 'rnn_relu'.
-    vocab_size : int
-        Size of the input vocabulary.
-    embed_size : int
-        Dimension of embedding vectors.
-    hidden_size : int
-        Number of hidden units for RNN.
-    num_layers : int
-        Number of RNN layers.
-    dropout : float
-        Dropout rate to use for encoder output.
-    tie_weights : bool, default False
-        Whether to tie the weight matrices of output dense layer and input embedding layer.
-    """
-    def __init__(self, mode, vocab_size, embed_size, hidden_size,
-                 num_layers, tie_weights=False, dropout=0.5, **kwargs):
-        if tie_weights:
-            assert embed_size == hidden_size, "Embedding dimension must be equal to " \
-                                              "hidden dimension in order to tie weights. " \
-                                              "Got: emb: {}, hid: {}.".format(embed_size,
-                                                                              hidden_size)
-        super(StandardRNN, self).__init__(**kwargs)
-        self._mode = mode
-        self._embed_size = embed_size
-        self._hidden_size = hidden_size
-        self._num_layers = num_layers
-        self._dropout = dropout
-        self._tie_weights = tie_weights
-        self._vocab_size = vocab_size
-
-        with self.name_scope():
-            self.embedding = self._get_embedding()
-            self.encoder = self._get_encoder()
-            self.decoder = self._get_decoder()
-
-    def _get_embedding(self):
-        return ElmoCharacterEncoder(options)
-
-    def _get_encoder(self):
-        return ElmoLSTM(self._mode, self._num_layers, self._embed_size,
-                              self._hidden_size // 2, self._dropout, 0)
-
-    def _get_decoder(self):
-        output = nn.HybridSequential()
-        with output.name_scope():
-            output.add(nn.Dropout(self._dropout))
-            if self._tie_weights:
-                output.add(nn.Dense(self._vocab_size, flatten=False,
-                                    params=self.embedding[0].params))
-            else:
-                output.add(nn.Dense(self._vocab_size, flatten=False))
-        return output
-
-    def begin_state(self, *args, **kwargs):
-        return self.encoder.begin_state(*args, **kwargs)
-
-    def forward(self, inputs_forward, inputs_backward, states_forward=None, states_backward=None): # pylint: disable=arguments-differ
-        forward_embedded_inputs = self.embedding(inputs_forward)
-        backward_embedded_inputs = self.embedding(inputs_backward)
-
-        if not (states_forward and states_backward):
-            states_forward, states_backward = self.begin_state(batch_size=inputs_forward.shape[1])
-        outputs_forward, out_states_forward, outputs_backward, out_states_backward = self.encoder(forward_embedded_inputs, backward_embedded_inputs, states_forward, states_backward)
-
-        # out2 = mx.nd.empty((len(outputs_forward[-1]), outputs_forward[-1][0].shape[0], self._vocab_size))
-        # out = []
-        # for i in range(len(outputs_forward[-1])):
-        #     # out[i, :, :] = self.decoder(mx.nd.concat(outputs_forward[-1][0], outputs_backward[-1][0], dim=1))
-        #     out.append(self.decoder(mx.nd.concat(outputs_forward[-1][0], outputs_backward[-1][0], dim=1)))
-        # out2 = mx.nd.stack(*out)
-        forward_out = self.decoder(outputs_forward[-1])
-        backward_out = self.decoder(outputs_backward[-1])
-        return (forward_out, backward_out), (states_forward, states_backward)
-
-
 ###############################################################################
 # Load data
 ###############################################################################
@@ -264,27 +94,26 @@ vocab = UnicodeCharsVocabulary(nlp.data.Counter(train_dataset[0]), max_word_leng
 train_data, val_data, test_data = [x.batchify(vocab, args.batch_size, max_word_length, load='train_data' if x is train_dataset else None)
                                    for x in [train_dataset, val_dataset, test_dataset]]
 
-def get_batch(data_source, i, seq_len=None):
-    seq_len = min(seq_len if seq_len else args.bptt, len(data_source[0]) - 1 - i)
-    forward_data = data_source[0][i:i+seq_len]
-    backward_data = data_source[0][i+1:i+1+seq_len]
+def get_batch(data_source, index, seq_len=None):
+    i = index + 1
+    seq_len = min(seq_len if seq_len else 35, len(data_source[0]) - 1 - i)
+    data = data_source[0][i:i+seq_len]
     forward_target = data_source[1][i+1:i+1+seq_len]
-    backward_target = data_source[1][i:i+seq_len]
-    return (forward_data, backward_data), (forward_target, backward_target)
+    backward_target = data_source[1][i-1:i-1+seq_len]
+    return data, (forward_target, backward_target)
 
 
 ###############################################################################
 # Build the model
 ###############################################################################
 
-if args.weight_dropout:
-    model = AWDRNN(args.model, len(vocab), args.emsize, args.nhid, args.nlayers,
-                   args.tied, args.dropout, args.weight_dropout, args.dropout_h, args.dropout_i)
-else:
-    model = StandardRNN(args.model, len(vocab), options['lstm']['projection_dim'], args.nhid, args.nlayers,
+
+model = ElmoBiLM(args.model, len(vocab), options['lstm']['projection_dim'], args.nhid, args.nlayers,
                       args.tied, args.dropout)
 
 model.initialize(init.Xavier(), ctx=context)
+
+model.set_highway_bias()
 
 
 compression_params = None if args.gctype == 'none' else {'type': args.gctype, 'threshold': args.gcthreshold}
@@ -314,7 +143,7 @@ def evaluate(model, data_source, ctx):
     hidden = model.begin_state(batch_size=args.batch_size, func=mx.nd.zeros, ctx=ctx)
     for i in range(0, len(data_source[0]) - 1, args.bptt):
         data, target = get_batch(data_source, i)
-        data = data[0].as_in_context(ctx), data[1].as_in_context(ctx)
+        data = data.as_in_context(ctx)
         target = target[0].as_in_context(ctx), target[1].as_in_context(ctx)
         output, h = model(data[0], data[1], *hidden)
         L = loss(mx.nd.reshape(output[0], (-3, -1)), mx.nd.reshape(target[0], (-1,)))
@@ -323,7 +152,7 @@ def evaluate(model, data_source, ctx):
         L = loss(mx.nd.reshape(output[1], (-3, -1)), mx.nd.reshape(target[1], (-1,)))
         total_L += mx.nd.sum(L).asscalar()
 
-        ntotal += L.size
+        ntotal += 2 * L.size
     return total_L / ntotal
 
 def get_ppl(cur_loss):
@@ -348,8 +177,7 @@ def train():
         while i < len(train_data[0]) - 1 - 1:
             data, target = get_batch(train_data, i, seq_len=args.bptt)
 
-            forward_data_list = gluon.utils.split_and_load(data[0], context, batch_axis=1, even_split=True)
-            backward_data_list = gluon.utils.split_and_load(data[1], context, batch_axis=1, even_split=True)
+            data_list = gluon.utils.split_and_load(data, context, batch_axis=1, even_split=True)
             forward_target_list = gluon.utils.split_and_load(target[0], context, batch_axis=1, even_split=True)
             backward_target_list = gluon.utils.split_and_load(target[1], context, batch_axis=1, even_split=True)
             hiddens = detach(hiddens)
@@ -357,19 +185,19 @@ def train():
             L = 0
             Ls = []
             with autograd.record():
-                for j, (X_forward, X_backward, y_forward, y_backward, h) in enumerate(zip(forward_data_list, backward_data_list, forward_target_list, backward_target_list, hiddens)):
-                    output, h = model(X_forward, X_backward, *h)
+                for j, (X, y_forward, y_backward, h) in enumerate(zip(data_list, forward_target_list, backward_target_list, hiddens)):
+                    output, h = model(X, *h)
                     batch_L = loss(mx.nd.reshape(output[0], (-3, -1)), mx.nd.reshape(y_forward, (-1,)))
                     L = L + batch_L.as_in_context(context[0]) / y_forward.size
                     Ls.append(batch_L / y_forward.size)
 
                     batch_L = loss(mx.nd.reshape(output[1], (-3, -1)), mx.nd.reshape(y_backward, (-1,)))
-                    L = L + batch_L.as_in_context(context[0]) / y_forward.size
-                    Ls.append(batch_L / y_forward.size)
+                    L = L + batch_L.as_in_context(context[0]) / y_backward.size
+                    Ls.append(batch_L / y_backward.size)
                     hiddens[j] = h
 
             L.backward()
-            grads = [p.grad(x.context) for p in parameters for x in forward_data_list]
+            grads = [p.grad(x.context) for p in parameters for x in data_list]
             gluon.utils.clip_global_norm(grads, args.clip)
 
             trainer.step(1)
@@ -390,14 +218,14 @@ def train():
 
         print('[Epoch %d] throughput %.2f samples/s' % (
             epoch, (args.batch_size * len(train_data[0])) / (time.time() - start_epoch_time)))
-        val_L = evaluate(model, val_data, context[0]) / 2
+        val_L = evaluate(model, val_data, context[0])
         ppl = get_ppl(val_L)
         print('[Epoch %d] time cost %.2fs, valid loss %.2f, valid ppl %.2f' % (
             epoch, time.time() - start_epoch_time, val_L, ppl))
 
         if val_L < best_val:
             best_val = val_L
-            test_L = evaluate(model, test_data, context[0]) / 2
+            test_L = evaluate(model, test_data, context[0])
             model.collect_params().save(args.save)
             ppl = get_ppl(test_L)
             print('test loss %.2f, test ppl %.2f' % (test_L, ppl))
@@ -414,8 +242,8 @@ if __name__ == '__main__':
     if not args.eval_only:
         train()
     model.collect_params().load(args.save, context)
-    val_L = evaluate(model, val_data, context[0]) / 2
-    test_L = evaluate(model, test_data, context[0]) / 2
+    val_L = evaluate(model, val_data, context[0])
+    test_L = evaluate(model, test_data, context[0])
     print('Best validation loss %.2f, test ppl %.2f' % (val_L, math.exp(val_L)))
     print('Best test loss %.2f, test ppl %.2f' % (test_L, math.exp(test_L)))
     print('Total time cost %.2fs' % (time.time() - start_pipeline_time))

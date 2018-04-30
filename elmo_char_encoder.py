@@ -118,6 +118,9 @@ class ElmoCharacterEncoder(gluon.Block):
 
             self.projection = nn.Dense(in_units=n_filters, units=self.output_dim, use_bias=True)
 
+    def set_highway_bias(self):
+        self.highways.set_bias()
+
     def forward(self, inputs):
         max_chars_per_token = self._options['char_cnn']['max_characters_per_token']
 
@@ -157,8 +160,9 @@ class ElmoCharacterEncoder(gluon.Block):
 
         return token_embedding.reshape(sequence_length, batch_size, -1)
 
-# # cnn = ElmoCharacterEncoder(options, 'https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5', True)
+# cnn = ElmoCharacterEncoder(options, 'https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5', True)
 # cnn = ElmoCharacterEncoder(options)
 # cnn.collect_params().initialize()
-# train_data = mx.nd.load('data')
+# cnn.set_highway_bias()
+# train_data = nd.load('data')
 # output = cnn(train_data)

@@ -59,43 +59,6 @@ class WikiText2Character(WikiText2):
             # return np.array(data[:sample_len*batch_size], dtype=object).reshape(batch_size, -1).T
             return vocab.dataset_to_char_ids(data[:sample_len*batch_size], batch_size, sample_len, max_word_length).swapaxes(0, 1), mx.nd.array(vocab[data[:sample_len*batch_size]]).reshape(batch_size, -1).T
 
-    # def bptt_batchify(self, vocab, seq_len, batch_size, last_batch='keep', load_path=None, max_word_length=50, lazy=True):
-    #     """Transform the dataset into batches of numericalized samples, in the way that the
-    #     recurrent states from last batch connects with the current batch for each sample.
-    #
-    #     Each sample is of shape `(seq_len, batch_size)`. When `last_batch='keep'`, the first
-    #     dimension of last sample may be shorter than `seq_len`.
-    #
-    #     Parameters
-    #     ----------
-    #     vocab : gluonnlp.Vocab
-    #         The vocabulary to use for numericalizing the dataset. Each token will be mapped to the
-    #         index according to the vocabulary.
-    #     seq_len : int
-    #         The length of each of the samples for truncated back-propagation-through-time (TBPTT).
-    #     batch_size : int
-    #         The number of samples in each batch.
-    #     last_batch : {'keep', 'discard'}
-    #         How to handle the last batch if the remaining length is less than `seq_len`.
-    #
-    #         keep - A batch with less samples than previous batches is returned.
-    #         discard - The last batch is discarded if its incomplete.
-    #     """
-    #     if load_path:
-    #         batches = mx.nd.load(load_path)
-    #     else:
-    #         data = self.batchify(vocab, batch_size)
-    #         batches = slice_sequence(data, seq_len+1, overlap=1)
-    #         if last_batch == 'keep':
-    #             sample_len = len(self._data[0]) // batch_size
-    #             has_short_batch = _slice_pad_length(sample_len*batch_size, seq_len+1, 1) > 0
-    #             if has_short_batch:
-    #                 batches.append(data[seq_len*len(batches):, :])
-    #     # TODO: +1 for masks
-    #     return SimpleDataset(batches).transform(lambda x:
-    #                                             (vocab.array_to_char_ids(x[:min(len(x)-1, seq_len), :], max_word_length),
-    #                                              mx.nd.array(vocab[x[1:, :]])))
-
 
 def _slice_pad_length(num_items, length, overlap=0):
     """Calculate the padding length needed for sliced samples in order not to discard data.
