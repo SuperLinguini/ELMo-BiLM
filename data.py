@@ -275,12 +275,12 @@ class UnicodeCharsVocabulary(Vocab):
         """
 
         if isinstance(tokens, (list, tuple)):
-            return [self._to_idx(token) for token in tokens]
+            return [self._token_to_idx[token] for token in tokens]
         elif isinstance(tokens, np.ndarray):
-            vfunc = np.vectorize(self._to_idx)
+            vfunc = np.vectorize(self._token_to_idx.__getitem__)
             return vfunc(tokens)
         else:
-            return self._to_idx(tokens)
+            return self._token_to_idx[tokens]
 
 
 # train_dataset, val_dataset, test_dataset = [WikiText2Character(segment=segment,
