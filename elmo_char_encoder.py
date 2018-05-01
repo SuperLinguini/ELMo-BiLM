@@ -4,27 +4,6 @@ from mxnet.ndarray.ndarray import NDArray
 from mxnet.gluon import nn, Block
 from overrides import overrides
 
-options = {
-  "lstm": {
-    "use_skip_connections": True,
-    "projection_dim": 512,
-    "cell_clip": 3,
-    "proj_clip": 3,
-    "dim": 4096,
-    "n_layers": 2
-  },
-  "char_cnn": {
-    "activation": "relu",
-    "filters": [[1, 32], [2, 32], [3, 64], [4, 128], [5, 256], [6, 512], [7, 1024]],
-    "n_highway": 2,
-    "embedding": {
-      "dim": 16
-    },
-    "n_characters": 262,
-    "max_characters_per_token": 50
-  }
-}
-
 class Highway(gluon.Block):
     """
     A `Highway layer <https://arxiv.org/abs/1505.00387>`_ does a gated combination of a linear

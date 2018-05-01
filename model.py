@@ -27,13 +27,11 @@ elmo_options = {
 
 
 class ElmoLSTM(gluon.Block):
-    def __init__(self, mode, num_layers, input_size, hidden_size, dropout, weight_dropout, bidirectional=True):
+    def __init__(self, mode, num_layers, input_size, hidden_size, dropout, weight_dropout, char_embedding, bidirectional=True):
         super(ElmoLSTM, self).__init__()
 
         self.num_layers = num_layers
-
-        forward_layers = []
-        backward_layers = []
+        self.char_embedding = char_embedding
 
         lstm_input_size = input_size
 
@@ -42,20 +40,18 @@ class ElmoLSTM(gluon.Block):
                 forward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, dropout, weight_dropout, 0, 0, 0)
                 backward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, dropout, weight_dropout, 0, 0, 0)
 
-                self.register_child(forward_layer)
-                self.register_child(backward_layer)
-
-                forward_layers.append(forward_layer)
-                backward_layers.append(backward_layer)
+                setattr(self, 'forward_layer_{}'.format(layer_index), forward_layer)
+                setattr(self, 'backward_layer_{}'.format(layer_index), backward_layer)
 
                 lstm_input_size = hidden_size
-            self.forward_layers = forward_layers
-            self.backward_layers = backward_layers
 
     def begin_state(self, *args, **kwargs):
-        return [forward_layer.begin_state(*args, **kwargs) for forward_layer in self.forward_layers], [backward_layer.begin_state(*args, **kwargs) for backward_layer in self.backward_layers]
+        return [getattr(self, 'forward_layer_{}'.format(layer_index)).begin_state(*args, **kwargs) for layer_index in range(self.num_layers)],\
+               [getattr(self, 'backward_layer_{}'.format(layer_index)).begin_state(*args, **kwargs) for layer_index in range(self.num_layers)]
 
     def forward(self, inputs, states_forward=None, states_backward=None):
+        seq_len = inputs.shape[0] if self.char_embedding else inputs[0].shape[0]
+
         if not (states_forward and states_backward):
             states_forward, states_backward = self.begin_state(batch_size=inputs.shape[1])
 
@@ -66,20 +62,20 @@ class ElmoLSTM(gluon.Block):
 
         for j in range(self.num_layers):
             outputs_forward.append([])
-            for i in range(inputs.shape[0]):
+            for i in range(seq_len):
                 if j == 0:
-                    output, states_forward[j] = self.forward_layers[j](inputs[i], states_forward[j])
+                    output, states_forward[j] = getattr(self, 'forward_layer_{}'.format(j))(inputs[i] if self.char_embedding else inputs[0][i], states_forward[j])
                 else:
-                    output, states_forward[j] = self.forward_layers[j](outputs_forward[j-1][i], states_forward[j])
+                    output, states_forward[j] = getattr(self, 'forward_layer_{}'.format(j))(outputs_forward[j-1][i], states_forward[j])
                 outputs_forward[j].append(output)
             out_states_forward.append(states_forward[j])
 
-            outputs_backward.append([None] * inputs.shape[0])
-            for i in reversed(range(inputs.shape[0])):
+            outputs_backward.append([None] * seq_len)
+            for i in reversed(range(seq_len)):
                 if j == 0:
-                    output, states_backward[j] = self.backward_layers[j](inputs[i], states_backward[j])
+                    output, states_backward[j] = getattr(self, 'backward_layer_{}'.format(j))(inputs[i] if self.char_embedding else inputs[1][i], states_backward[j])
                 else:
-                    output, states_backward[j] = self.backward_layers[j](outputs_backward[j-1][i], states_backward[j])
+                    output, states_backward[j] = getattr(self, 'backward_layer_{}'.format(j))(outputs_backward[j-1][i], states_backward[j])
                 outputs_backward[j][i] = output
             out_states_backward.append(states_backward[j])
 
@@ -110,7 +106,7 @@ class ElmoBiLM(gluon.Block):
         Whether to tie the weight matrices of output dense layer and input embedding layer.
     """
     def __init__(self, mode, vocab_size, embed_size, hidden_size,
-                 num_layers, tie_weights=False, dropout=0.5, options=elmo_options, **kwargs):
+                 num_layers, tie_weights=False, dropout=0.5, char_embedding=False, options=elmo_options, **kwargs):
         if tie_weights:
             assert embed_size == hidden_size, "Embedding dimension must be equal to " \
                                               "hidden dimension in order to tie weights. " \
@@ -124,6 +120,7 @@ class ElmoBiLM(gluon.Block):
         self._dropout = dropout
         self._tie_weights = tie_weights
         self._vocab_size = vocab_size
+        self.char_embedding = char_embedding
         self.options = options
 
         with self.name_scope():
@@ -132,11 +129,20 @@ class ElmoBiLM(gluon.Block):
             self.decoder = self._get_decoder()
 
     def _get_embedding(self):
-        return ElmoCharacterEncoder(self.options)
+        if self.char_embedding:
+            return ElmoCharacterEncoder(self.options)
+        else:
+            embedding = nn.HybridSequential()
+            with embedding.name_scope():
+                embedding.add(nn.Embedding(self._vocab_size, self._embed_size,
+                                           weight_initializer=init.Uniform(0.1)))
+                if self._dropout:
+                    embedding.add(nn.Dropout(self._dropout))
+            return embedding
 
     def _get_encoder(self):
         return ElmoLSTM(self._mode, self._num_layers, self._embed_size,
-                              self._hidden_size // 2, self._dropout, 0)
+                              self._hidden_size // 2, self._dropout, 0, self.char_embedding)
 
     def _get_decoder(self):
         output = nn.HybridSequential()
@@ -156,7 +162,10 @@ class ElmoBiLM(gluon.Block):
         return self.encoder.begin_state(*args, **kwargs)
 
     def forward(self, inputs, states_forward=None, states_backward=None): # pylint: disable=arguments-differ
-        embedded_inputs = self.embedding(inputs)
+        if self.char_embedding:
+            embedded_inputs = self.embedding(inputs)
+        else:
+            embedded_inputs = self.embedding(inputs[0]), self.embedding(inputs[1])
 
         if not (states_forward and states_backward):
             states_forward, states_backward = self.begin_state(batch_size=inputs.shape[1])
