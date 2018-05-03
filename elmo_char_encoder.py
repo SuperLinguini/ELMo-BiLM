@@ -1,4 +1,6 @@
 import json
+import h5py
+import numpy as np
 from mxnet import gluon, autograd, init, nd
 from mxnet.ndarray.ndarray import NDArray
 from mxnet.gluon import nn, Block
@@ -64,7 +66,7 @@ class Highway(gluon.Block):
         return current_input
 
 class ElmoCharacterEncoder(gluon.Block):
-    def __init__(self, options):
+    def __init__(self, options, weight_file=None):
         super(ElmoCharacterEncoder, self).__init__()
 
         if isinstance(options, dict):
@@ -75,6 +77,7 @@ class ElmoCharacterEncoder(gluon.Block):
         # self._weight_file = weight_file
 
         self.output_dim = self._options['lstm']['projection_dim']
+        self.weight_file = weight_file
         # self.requires_grad = requires_grad
 
         cnn_options = self._options['char_cnn']
@@ -87,7 +90,6 @@ class ElmoCharacterEncoder(gluon.Block):
             self.embedding = nn.Embedding(input_dim=cnn_options['n_characters'],
                                       output_dim=char_embed_dim)
 
-            convolutions = []
             for i, (width, out_channels) in enumerate(filters):
                 conv = nn.Conv1D(in_channels=char_embed_dim, channels=out_channels, kernel_size=width, use_bias=True)
                 setattr(self, 'char_conv_{}'.format(i), conv)
@@ -138,6 +140,75 @@ class ElmoCharacterEncoder(gluon.Block):
         sequence_length, batch_size, _ = inputs.shape
 
         return token_embedding.reshape(sequence_length, batch_size, -1)
+
+    def load_weights(self):
+        self._load_char_embedding()
+        self._load_cnn_weights()
+        self._load_highway()
+        self._load_projection()
+
+    def _load_char_embedding(self):
+        with h5py.File(self.weight_file, 'r') as fin:
+            char_embed_weights = fin['char_embed'][...]
+
+        weights = np.zeros(
+            (char_embed_weights.shape[0] + 1, char_embed_weights.shape[1]),
+            dtype='float32'
+        )
+
+        weights[1:, :] = char_embed_weights
+
+        self.embedding.weight.set_data(weights)
+
+    def _load_cnn_weights(self):
+        cnn_options = self._options['char_cnn']
+        filters = cnn_options['filters']
+
+        for i, (width, num) in enumerate(filters):
+            with h5py.File(self.weight_file, 'r') as fin:
+                weight = fin['CNN']['W_cnn_{}'.format(i)][...]
+                bias = fin['CNN']['b_cnn_{}'.format(i)][...]
+
+            conv = getattr(self, 'char_conv_{}'.format(i))
+
+            w_reshaped = np.transpose(weight.squeeze(axis=0), axes=(2, 1, 0))
+            if w_reshaped.shape != conv.weight.shape:
+                raise ValueError('Invalid weight file')
+
+            conv.weight.set_data(w_reshaped)
+            conv.bias.set_data(bias)
+
+    def _load_highway(self):
+        # the highway layers have same dimensionality as the number of cnn filters
+        cnn_options = self._options['char_cnn']
+        filters = cnn_options['filters']
+        n_highway = cnn_options['n_highway']
+
+        for k in range(n_highway):
+            with h5py.File(self.weight_file, 'r') as fin:
+                # The weights are transposed due to multiplication order assumptions in tf
+                # vs pytorch (tf.matmul(X, W) vs pytorch.matmul(W, X))
+                w_transform = np.transpose(fin['CNN_high_{}'.format(k)]['W_transform'][...])
+                # -1.0 since AllenNLP is g * x + (1 - g) * f(x) but tf is (1 - g) * x + g * f(x)
+                w_carry = -1.0 * np.transpose(fin['CNN_high_{}'.format(k)]['W_carry'][...])
+                weight = np.concatenate([w_transform, w_carry], axis=0)
+                layer = getattr(self.highways, 'layer_{}'.format(k))
+                layer.weight.set_data(weight)
+
+                b_transform = fin['CNN_high_{}'.format(k)]['b_transform'][...]
+                b_carry = -1.0 * fin['CNN_high_{}'.format(k)]['b_carry'][...]
+                bias = np.concatenate([b_transform, b_carry], axis=0)
+                layer.bias.set_data(bias)
+
+    def _load_projection(self):
+        cnn_options = self._options['char_cnn']
+        filters = cnn_options['filters']
+
+        with h5py.File(self.weight_file, 'r') as fin:
+            weight = fin['CNN_proj']['W_proj'][...]
+            bias = fin['CNN_proj']['b_proj'][...]
+            self.projection.weight.set_data(np.transpose(weight))
+            self.projection.bias.set_data(bias)
 
 # cnn = ElmoCharacterEncoder(options, 'https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5', True)
 # cnn = ElmoCharacterEncoder(options)

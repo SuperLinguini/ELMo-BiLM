@@ -23,7 +23,7 @@ from mxnet import gluon, autograd, init, nd
 from mxnet.gluon import nn
 
 from data import UnicodeCharsVocabulary, WikiText2Character
-from model import ElmoBiLM, elmo_options as options
+from model import ElmoBiLM
 
 import gluonnlp as nlp
 # from gluonnlp.model import StandardRNN, AWDRNN
@@ -37,12 +37,16 @@ parser.add_argument('--nhid', type=int, default=1200,
                     help='number of hidden units per layer')
 parser.add_argument('--nlayers', type=int, default=2,
                     help='number of layers')
-parser.add_argument('--lr', type=float, default=1.0,
+parser.add_argument('--lr', type=float, default=30,
                     help='initial learning rate')
 parser.add_argument('--lr_update_interval', type=int, default=30,
                     help='lr udpate interval')
 parser.add_argument('--lr_update_factor', type=float, default=0.1,
                     help='lr udpate factor')
+parser.add_argument('--optimizer', type=str, default='sgd',
+                    help='optimizer to use (sgd, adagrad, adam)')
+parser.add_argument('--wd', type=float, default=1.2e-6,
+                    help='weight decay applied to all weights')
 parser.add_argument('--clip', type=float, default=0.25,
                     help='gradient clipping')
 parser.add_argument('--epochs', type=int, default=200,
@@ -51,7 +55,7 @@ parser.add_argument('--batch_size', type=int, default=80, metavar='N',
                     help='batch size')
 parser.add_argument('--bptt', type=int, default=35,
                     help='sequence length')
-parser.add_argument('--dropout', type=float, default=0.4,
+parser.add_argument('--dropout', type=float, default=0.1,
                     help='dropout applied to layers (0 = no dropout)')
 parser.add_argument('--dropout_h', type=float, default=0.2,
                     help='dropout applied to hidden layer (0 = no dropout)')
@@ -65,6 +69,7 @@ parser.add_argument('--log-interval', type=int, default=50, metavar='N',
                     help='report interval')
 parser.add_argument('--save', type=str, default='model.params',
                     help='path to save the final model')
+parser.add_argument('--load', action='store_true', help='Whether to load existing model weights from save')
 parser.add_argument('--gctype', type=str, default='none',
                     help='type of gradient compression to use, \
                           takes `2bit` or `none` for now.')
@@ -75,6 +80,7 @@ parser.add_argument('--eval_only', action='store_true',
 parser.add_argument('--gpus', type=str,
                     help='list of gpus to run, e.g. 0 or 0,2,5. empty means using cpu. (the result of multi-gpu training might be slightly different compared to single-gpu training, still need to be finalized)')
 parser.add_argument('--char_embedding', action='store_true', help='Whether to use character embeddings or word embeddings')
+parser.add_argument('--char_embedding_weight_file', type=str, default='elmo_weights.hdf5', help='File location for character embedding weights file')
 args = parser.parse_args()
 
 ###############################################################################
@@ -126,9 +132,8 @@ def get_batch_word_embedding(data_source, i, seq_len=None):
 # Build the model
 ###############################################################################
 
-
-model = ElmoBiLM(args.model, len(vocab), args.emsize,
-                 args.nhid, args.nlayers, args.tied, args.dropout)
+model = ElmoBiLM(mode=args.model, vocab_size=len(vocab), embed_size=args.emsize, hidden_size=args.nhid,
+                 num_layers=args.nlayers, tie_weights=args.tied, dropout=args.dropout, char_embedding=args.char_embedding, weight_file=args.char_embedding_weight_file)
 
 model.initialize(init.Xavier(), ctx=context)
 model.hybridize()
@@ -136,13 +141,28 @@ model.hybridize()
 if args.char_embedding:
     model.set_highway_bias()
 
+    if args.char_embedding_weight_file:
+        model.load_char_embedding_weight()
+        model.embedding.collect_params().setattr('grad_req', 'null')
+
 
 compression_params = None if args.gctype == 'none' else {'type': args.gctype, 'threshold': args.gcthreshold}
-trainer = gluon.Trainer(model.collect_params(), 'sgd',
-                        {'learning_rate': args.lr,
-                         'momentum': 0,
-                         'wd': 0},
-                        compression_params=compression_params)
+
+if args.optimizer == 'sgd':
+    trainer_params = {'learning_rate': args.lr,
+                      'momentum': 0,
+                      'wd': args.wd}
+elif args.optimizer == 'adam':
+    trainer_params = {'learning_rate': args.lr,
+                      'wd': args.wd,
+                      'beta1': 0,
+                      'beta2': 0.999,
+                      'epsilon': 1e-9}
+elif args.optimizer == 'adagrad':
+    trainer_params = {'learning_rate': args.lr}
+
+trainer = gluon.Trainer(model.collect_params(), args.optimizer, trainer_params)
+
 loss = gluon.loss.SoftmaxCrossEntropyLoss()
 
 ###############################################################################
@@ -162,7 +182,7 @@ def evaluate(model, data_source, ctx):
     total_L = 0.0
     ntotal = 0
     hidden = model.begin_state(batch_size=args.batch_size, func=mx.nd.zeros, ctx=ctx)
-    for i in range(0, len(data_source[0]) - 1, args.bptt):
+    for i in range(0, len(data_source[0]) - 2, args.bptt):
         if args.char_embedding:
             data, target = get_batch_char_embedding(data_source, i)
             data = data.as_in_context(ctx)
@@ -261,7 +281,7 @@ def train_char(epoch, parameters):
                 hiddens[j] = h
 
         L.backward()
-        grads = [p.grad(x.context) for p in parameters for x in data_list]
+        grads = [p.grad(x.context) for p in parameters if p.grad_req != 'null' for x in data_list]
         gluon.utils.clip_global_norm(grads, args.clip)
 
         trainer.step(1)
@@ -271,9 +291,9 @@ def train_char(epoch, parameters):
 
         if batch_i % args.log_interval == 0 and batch_i > 0:
             cur_L = total_L / (args.log_interval * 2)
-            print('[Epoch %d Batch %d/%d] loss %.2f, ppl %.2f, throughput %.2f samples/s, lr %.2f' % (
+            print('[Epoch %d Batch %d/%d] loss %.2f, ppl %.2f, throughput %.2f samples/s, lr %.5f' % (
                 epoch, batch_i, len(train_data[0]) // args.bptt, cur_L, math.exp(cur_L),
-                args.batch_size * args.log_interval / (time.time() - start_log_interval_time), args.lr))
+                args.batch_size * args.log_interval / (time.time() - start_log_interval_time), lr_batch_start))
             total_L = 0.0
             start_log_interval_time = time.time()
         i += args.bptt
@@ -329,6 +349,8 @@ def train_word(epoch, parameters):
 
 if __name__ == '__main__':
     start_pipeline_time = time.time()
+    if args.load:
+        model.collect_params().load(args.save, context)
     if not args.eval_only:
         train()
     model.collect_params().load(args.save, context)

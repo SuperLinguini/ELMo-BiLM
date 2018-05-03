@@ -106,7 +106,7 @@ class ElmoBiLM(gluon.Block):
         Whether to tie the weight matrices of output dense layer and input embedding layer.
     """
     def __init__(self, mode, vocab_size, embed_size, hidden_size,
-                 num_layers, tie_weights=False, dropout=0.5, char_embedding=False, options=elmo_options, **kwargs):
+                 num_layers, tie_weights=False, dropout=0.5, char_embedding=False, options=elmo_options, weight_file=None, **kwargs):
         if tie_weights:
             assert embed_size == hidden_size, "Embedding dimension must be equal to " \
                                               "hidden dimension in order to tie weights. " \
@@ -114,13 +114,14 @@ class ElmoBiLM(gluon.Block):
                                                                               hidden_size)
         super(ElmoBiLM, self).__init__(**kwargs)
         self._mode = mode
-        self._embed_size = embed_size
+        self._embed_size = options['lstm']['projection_dim'] if char_embedding else embed_size
         self._hidden_size = hidden_size
         self._num_layers = num_layers
         self._dropout = dropout
         self._tie_weights = tie_weights
         self._vocab_size = vocab_size
         self.char_embedding = char_embedding
+        self.weight_file = weight_file
         self.options = options
 
         with self.name_scope():
@@ -130,7 +131,7 @@ class ElmoBiLM(gluon.Block):
 
     def _get_embedding(self):
         if self.char_embedding:
-            return ElmoCharacterEncoder(self.options)
+            return ElmoCharacterEncoder(self.options, self.weight_file)
         else:
             embedding = nn.HybridSequential()
             with embedding.name_scope():
@@ -157,6 +158,9 @@ class ElmoBiLM(gluon.Block):
 
     def set_highway_bias(self):
         self.embedding.set_highway_bias()
+
+    def load_char_embedding_weight(self):
+        self.embedding.load_weights()
 
     def begin_state(self, *args, **kwargs):
         return self.encoder.begin_state(*args, **kwargs)
