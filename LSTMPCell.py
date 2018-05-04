@@ -58,8 +58,7 @@ class LSTMPCell(HybridRecurrentCell):
           the same shape as `states`.
     """
     def __init__(self, hidden_size, cell_size,
-                 i2h_weight_initializer=None, h2h_weight_initializer=None,
-                 i2h_bias_initializer='zeros', h2h_bias_initializer='zeros',
+                 i2h_weight_initializer=None, h2h_weight_initializer=None, h2h_bias_initializer='lstmbias',
                  h2proj_weight_initializer=None, input_size=0,
                  memory_cell_clip_value=None, state_projection_clip_value=None, prefix=None, params=None):
         super(LSTMPCell, self).__init__(prefix=prefix, params=params)
@@ -75,9 +74,6 @@ class LSTMPCell(HybridRecurrentCell):
         self.h2h_weight = self.params.get('h2h_weight', shape=(4*cell_size, hidden_size),
                                           init=h2h_weight_initializer,
                                           allow_deferred_init=True)
-        self.i2h_bias = self.params.get('i2h_bias', shape=(4*cell_size,),
-                                        init=i2h_bias_initializer,
-                                        allow_deferred_init=True)
         self.h2h_bias = self.params.get('h2h_bias', shape=(4*cell_size,),
                                         init=h2h_bias_initializer,
                                         allow_deferred_init=True)
@@ -100,10 +96,10 @@ class LSTMPCell(HybridRecurrentCell):
                         **self.__dict__)
 
     def hybrid_forward(self, F, inputs, states, i2h_weight,
-                       h2h_weight, i2h_bias, h2h_bias, h2proj_weight):
+                       h2h_weight, h2h_bias, h2proj_weight):
         prefix = 't%d_'%self._counter
-        i2h = F.FullyConnected(data=inputs, weight=i2h_weight, bias=i2h_bias,
-                               num_hidden=self._cell_size*4, name=prefix+'i2h')
+        i2h = F.FullyConnected(data=inputs, weight=i2h_weight, bias=None,
+                               num_hidden=self._cell_size*4, name=prefix+'i2h', no_bias=True)
         h2h = F.FullyConnected(data=states[0], weight=h2h_weight, bias=h2h_bias,
                                num_hidden=self._cell_size*4, name=prefix+'h2h')
         gates = i2h + h2h
