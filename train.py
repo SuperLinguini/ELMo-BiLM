@@ -33,8 +33,9 @@ parser.add_argument('--model', type=str, default='lstm',
                     help='type of recurrent net (rnn_tanh, rnn_relu, lstm, gru)')
 parser.add_argument('--emsize', type=int, default=200,
                     help='size of word embeddings')
-parser.add_argument('--nhid', type=int, default=1200,
+parser.add_argument('--nhid', type=int, default=512,
                     help='number of hidden units per layer')
+parser.add_argument('--ncell', type=int, default=4096)
 parser.add_argument('--nlayers', type=int, default=2,
                     help='number of layers')
 parser.add_argument('--lr', type=float, default=30,
@@ -132,8 +133,8 @@ def get_batch_word_embedding(data_source, i, seq_len=None):
 # Build the model
 ###############################################################################
 
-model = ElmoBiLM(mode=args.model, vocab_size=len(vocab), embed_size=args.emsize, hidden_size=args.nhid,
-                 num_layers=args.nlayers, tie_weights=args.tied, dropout=args.dropout, char_embedding=args.char_embedding, weight_file=args.char_embedding_weight_file)
+model = ElmoBiLM(mode=args.model, vocab_size=len(vocab), embed_size=args.emsize, hidden_size=args.nhid, cell_size=args.ncell,
+                 num_layers=args.nlayers, tie_weights=args.tied, dropout=args.dropout, char_embedding=args.char_embedding, weight_file=args.hdf5_weight_file)
 
 model.initialize(init.Xavier(), ctx=context)
 model.hybridize()
