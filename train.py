@@ -81,7 +81,11 @@ parser.add_argument('--eval_only', action='store_true',
 parser.add_argument('--gpus', type=str,
                     help='list of gpus to run, e.g. 0 or 0,2,5. empty means using cpu. (the result of multi-gpu training might be slightly different compared to single-gpu training, still need to be finalized)')
 parser.add_argument('--char_embedding', action='store_true', help='Whether to use character embeddings or word embeddings')
-parser.add_argument('--char_embedding_weight_file', type=str, default='elmo_weights.hdf5', help='File location for character embedding weights file')
+parser.add_argument('--hdf5_weight_file', type=str, default='elmo_weights.hdf5', help='File location for character embedding weights file')
+parser.add_argument('--load_hdf5_bilstm', action='store_true', help='Whether to use load bilstm weights for hdf5 file')
+parser.add_argument('--load_hdf5_word_embed', action='store_true', help='Whether to use load word embedding weights for hdf5 file')
+parser.add_argument('--load_hdf5_char_embed', action='store_true', help='Whether to use load character embedding weights for hdf5 file')
+
 args = parser.parse_args()
 
 ###############################################################################
@@ -139,12 +143,20 @@ model = ElmoBiLM(mode=args.model, vocab_size=len(vocab), embed_size=args.emsize,
 model.initialize(init.Xavier(), ctx=context)
 model.hybridize()
 
+if args.hdf5_weight_file:
+    if args.load_hdf5_word_embed:
+        model.load_word_embedding_weights()
+    if args.load_hdf5_bilstm:
+        model.load_lstm_weights()
+        # model.encoder.collect_params().setattr('grad_req', 'null')
+
 if args.char_embedding:
     model.set_highway_bias()
 
-    if args.char_embedding_weight_file:
-        model.load_char_embedding_weight()
-        model.embedding.collect_params().setattr('grad_req', 'null')
+    if args.hdf5_weight_file:
+        if args.load_hdf5_char_embed:
+            model.load_char_embedding_weights()
+            model.embedding.collect_params().setattr('grad_req', 'null')
 
 
 compression_params = None if args.gctype == 'none' else {'type': args.gctype, 'threshold': args.gcthreshold}
@@ -293,7 +305,7 @@ def train_char(epoch, parameters):
         if batch_i % args.log_interval == 0 and batch_i > 0:
             cur_L = total_L / (args.log_interval * 2)
             print('[Epoch %d Batch %d/%d] loss %.2f, ppl %.2f, throughput %.2f samples/s, lr %.5f' % (
-                epoch, batch_i, len(train_data[0]) // args.bptt, cur_L, math.exp(cur_L),
+                epoch, batch_i, len(train_data[0]) // args.bptt, cur_L, get_ppl(cur_L),
                 args.batch_size * args.log_interval / (time.time() - start_log_interval_time), lr_batch_start))
             total_L = 0.0
             start_log_interval_time = time.time()
@@ -341,7 +353,7 @@ def train_word(epoch, parameters):
         if batch_i % args.log_interval == 0 and batch_i > 0:
             cur_L = total_L / (args.log_interval * 2)
             print('[Epoch %d Batch %d/%d] loss %.2f, ppl %.2f, throughput %.2f samples/s, lr %.2f' % (
-                epoch, batch_i, len(train_data) // args.bptt, cur_L, math.exp(cur_L),
+                epoch, batch_i, len(train_data) // args.bptt, cur_L, get_ppl(cur_L),
                 args.batch_size * args.log_interval / (time.time() - start_log_interval_time), args.lr))
             total_L = 0.0
             start_log_interval_time = time.time()

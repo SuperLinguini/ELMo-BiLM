@@ -36,6 +36,7 @@ class ElmoLSTM(gluon.Block):
 
         self.num_layers = num_layers
         self.char_embedding = char_embedding
+        self.weight_file = weight_file
 
         lstm_input_size = input_size
 
@@ -90,6 +91,64 @@ class ElmoLSTM(gluon.Block):
             outputs_backward[i] = mx.nd.stack(*outputs_backward[i])
 
         return outputs_forward, out_states_forward, outputs_backward, out_states_backward
+
+    def load_weights(self):
+        """
+        Load the pre-trained weights from the file.
+        """
+        # requires_grad = self.requires_grad
+
+        with h5py.File(self.weight_file, 'r') as fin:
+            for layer_index in range(self.num_layers):
+                for i in range(2):
+                    # lstm is an instance of LSTMPCell
+                    lstm = getattr(self, 'forward_layer_{}'.format(layer_index) if i == 0 else 'backward_layer_{}'.format(layer_index))
+                    cell_size = lstm._cell_size
+
+                    dataset = fin['RNN_%s' % i]['RNN']['MultiRNNCell']['Cell%s' % layer_index]['LSTMCell']
+
+                    # tensorflow packs together both W and U matrices into one matrix,
+                    # but mxnet maintains individual matrices.  In addition, tensorflow
+                    # packs the gates as input, memory, forget, output but mxnet
+                    # uses input, forget, memory, output.  So we need to modify the weights.
+                    tf_weights = np.transpose(dataset['W_0'][...])
+                    torch_weights = tf_weights.copy()
+
+                    # split the W from U matrices
+                    input_size = lstm._input_size
+                    input_weights = torch_weights[:, :input_size]
+                    recurrent_weights = torch_weights[:, input_size:]
+                    tf_input_weights = tf_weights[:, :input_size]
+                    tf_recurrent_weights = tf_weights[:, input_size:]
+
+                    # handle the different gate order convention
+                    for torch_w, tf_w in [[input_weights, tf_input_weights],
+                                          [recurrent_weights, tf_recurrent_weights]]:
+                        torch_w[(1 * cell_size):(2 * cell_size), :] = tf_w[(2 * cell_size):(3 * cell_size), :]
+                        torch_w[(2 * cell_size):(3 * cell_size), :] = tf_w[(1 * cell_size):(2 * cell_size), :]
+
+                    lstm.i2h_weight.set_data(input_weights)
+                    lstm.h2h_weight.set_data(recurrent_weights)
+                    # lstm.input_linearity.weight.requires_grad = requires_grad
+                    # lstm.state_linearity.weight.requires_grad = requires_grad
+
+                    # the bias weights
+                    tf_bias = dataset['B'][...]
+                    # tensorflow adds 1.0 to forget gate bias instead of modifying the
+                    # parameters...
+                    tf_bias[(2 * cell_size):(3 * cell_size)] += 1
+                    torch_bias = tf_bias.copy()
+                    torch_bias[(1 * cell_size):(2 * cell_size)
+                              ] = tf_bias[(2 * cell_size):(3 * cell_size)]
+                    torch_bias[(2 * cell_size):(3 * cell_size)
+                              ] = tf_bias[(1 * cell_size):(2 * cell_size)]
+                    lstm.h2h_bias.set_data(torch_bias)
+                    # lstm.state_linearity.bias.requires_grad = requires_grad
+
+                    # the projection weights
+                    proj_weights = np.transpose(dataset['W_P_0'][...])
+                    lstm.h2proj_weight.set_data(proj_weights)
+                    # lstm.state_projection.weight.requires_grad = requires_grad
 
 class ElmoBiLM(gluon.Block):
     """Standard RNN language model.
@@ -167,8 +226,16 @@ class ElmoBiLM(gluon.Block):
     def set_highway_bias(self):
         self.embedding.set_highway_bias()
 
-    def load_char_embedding_weight(self):
+    def load_char_embedding_weights(self):
         self.embedding.load_weights()
+
+    def load_word_embedding_weights(self):
+        with h5py.File(self.weight_file, 'r') as fin:
+            embedding_weights = fin['embedding'][...]
+            self.embedding._children['0'].weight.set_data(nd.array(embedding_weights))
+
+    def load_lstm_weights(self):
+        self.encoder.load_weights()
 
     def begin_state(self, *args, **kwargs):
         return self.encoder.begin_state(*args, **kwargs)
