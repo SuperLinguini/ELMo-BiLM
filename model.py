@@ -2,7 +2,7 @@ import mxnet as mx
 import h5py
 import numpy as np
 from mxnet import gluon, autograd, init, nd
-from mxnet.gluon import nn
+from mxnet.gluon import nn, rnn
 from gluonnlp.model.utils import _get_rnn_cell
 from elmo_char_encoder import ElmoCharacterEncoder
 
@@ -29,21 +29,44 @@ elmo_options = {
   }
 }
 
+def _get_rnn_cell(mode, num_layers, input_size, hidden_size, dropout):
+    """create rnn cell given specs"""
+    rnn_cell = rnn.SequentialRNNCell()
+    with rnn_cell.name_scope():
+        for i in range(num_layers):
+            if mode == 'rnn_relu':
+                cell = rnn.RNNCell(hidden_size, 'relu', input_size=input_size)
+            elif mode == 'rnn_tanh':
+                cell = rnn.RNNCell(hidden_size, 'tanh', input_size=input_size)
+            elif mode == 'lstm':
+                cell = rnn.LSTMCell(hidden_size, input_size=input_size)
+            elif mode == 'gru':
+                cell = rnn.GRUCell(hidden_size, input_size=input_size)
+
+            rnn_cell.add(cell)
+            if dropout != 0:
+                rnn_cell.add(rnn.DropoutCell(dropout))
+
+    return rnn_cell
 
 class ElmoLSTM(gluon.Block):
-    def __init__(self, mode, num_layers, input_size, hidden_size, cell_size, dropout, weight_dropout, char_embedding, weight_file=None, bidirectional=True):
+    def __init__(self, mode, num_layers, input_size, hidden_size, cell_size, dropout, skip_connection, char_embedding, weight_file=None, bidirectional=True):
         super(ElmoLSTM, self).__init__()
 
         self.num_layers = num_layers
         self.char_embedding = char_embedding
         self.weight_file = weight_file
+        self.skip_connection = skip_connection
 
         lstm_input_size = input_size
 
         with self.name_scope():
             for layer_index in range(num_layers):
-                forward_layer = LSTMPCell(hidden_size, cell_size, input_size=lstm_input_size, memory_cell_clip_value=3, state_projection_clip_value=3)
-                backward_layer = LSTMPCell(hidden_size, cell_size, input_size=lstm_input_size, memory_cell_clip_value=3, state_projection_clip_value=3)
+                # forward_layer = LSTMPCell(hidden_size, cell_size, input_size=lstm_input_size, memory_cell_clip_value=3, state_projection_clip_value=3)
+                # backward_layer = LSTMPCell(hidden_size, cell_size, input_size=lstm_input_size, memory_cell_clip_value=3, state_projection_clip_value=3)
+
+                forward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, dropout)#, cell_size=cell_size)
+                backward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, dropout)#, cell_size=cell_size)
 
                 setattr(self, 'forward_layer_{}'.format(layer_index), forward_layer)
                 setattr(self, 'backward_layer_{}'.format(layer_index), backward_layer)
@@ -58,7 +81,7 @@ class ElmoLSTM(gluon.Block):
         seq_len = inputs.shape[0] if self.char_embedding else inputs[0].shape[0]
 
         if not (states_forward and states_backward):
-            states_forward, states_backward = self.begin_state(batch_size=inputs.shape[1])
+            states_forward, states_backward = self.begin_state(batch_size=inputs.shape[1] if self.char_embedding else inputs[0].shape[1])
 
         outputs_forward = []
         out_states_forward = []
@@ -72,7 +95,8 @@ class ElmoLSTM(gluon.Block):
                     output, states_forward[j] = getattr(self, 'forward_layer_{}'.format(j))(inputs[i] if self.char_embedding else inputs[0][i], states_forward[j])
                 else:
                     output, states_forward[j] = getattr(self, 'forward_layer_{}'.format(j))(outputs_forward[j-1][i], states_forward[j])
-                    output = output + outputs_forward[j-1][i]
+                    if self.skip_connection:
+                        output = output + outputs_forward[j-1][i]
                 outputs_forward[j].append(output)
             out_states_forward.append(states_forward[j])
 
@@ -82,7 +106,8 @@ class ElmoLSTM(gluon.Block):
                     output, states_backward[j] = getattr(self, 'backward_layer_{}'.format(j))(inputs[i] if self.char_embedding else inputs[1][i], states_backward[j])
                 else:
                     output, states_backward[j] = getattr(self, 'backward_layer_{}'.format(j))(outputs_backward[j-1][i], states_backward[j])
-                    output = output + outputs_backward[j-1][i]
+                    if self.skip_connection:
+                        output = output + outputs_backward[j-1][i]
                 outputs_backward[j][i] = output
             out_states_backward.append(states_backward[j])
 
@@ -171,7 +196,7 @@ class ElmoBiLM(gluon.Block):
         Whether to tie the weight matrices of output dense layer and input embedding layer.
     """
     def __init__(self, mode, vocab_size, embed_size, hidden_size, cell_size,
-                 num_layers, tie_weights=False, dropout=0.5, char_embedding=False, options=elmo_options, weight_file=None, **kwargs):
+                 num_layers, tie_weights=False, dropout=0.5, skip_connection=True, char_embedding=False, options=elmo_options, weight_file=None, **kwargs):
         if tie_weights:
             assert embed_size == hidden_size, "Embedding dimension must be equal to " \
                                               "hidden dimension in order to tie weights. " \
@@ -184,6 +209,7 @@ class ElmoBiLM(gluon.Block):
         self._cell_size = cell_size
         self._num_layers = num_layers
         self._dropout = dropout
+        self._skip_connection = skip_connection
         self._tie_weights = tie_weights
         self._vocab_size = vocab_size
         self.char_embedding = char_embedding
@@ -210,17 +236,16 @@ class ElmoBiLM(gluon.Block):
     def _get_encoder(self):
         return ElmoLSTM(mode=self._mode, num_layers=self._num_layers, input_size=self._embed_size,
                               hidden_size=self._hidden_size, cell_size=self._cell_size, dropout=self._dropout,
-                              weight_dropout=0, char_embedding=self.char_embedding, weight_file=self.weight_file)
+                              skip_connection=self._skip_connection, char_embedding=self.char_embedding, weight_file=self.weight_file)
 
     def _get_decoder(self):
         output = nn.HybridSequential()
         with output.name_scope():
-            output.add(nn.Dropout(self._dropout))
             if self._tie_weights:
                 output.add(nn.Dense(self._vocab_size, flatten=False,
                                     params=self.embedding[0].params))
             else:
-                output.add(nn.Dense(self._vocab_size, flatten=False))
+                output.add(nn.Dense(self._vocab_size, flatten=False, in_units=self._hidden_size))
         return output
 
     def set_highway_bias(self):
@@ -233,6 +258,11 @@ class ElmoBiLM(gluon.Block):
         with h5py.File(self.weight_file, 'r') as fin:
             embedding_weights = fin['embedding'][...]
             self.embedding._children['0'].weight.set_data(nd.array(embedding_weights))
+
+    def load_decoder(self):
+        with h5py.File(self.weight_file, 'r') as fin:
+            self.decoder._children['0'].weight.set_data(fin['softmax']['W'][...])
+            self.decoder._children['0'].bias.set_data(fin['softmax']['b'][...])
 
     def load_lstm_weights(self):
         self.encoder.load_weights()
@@ -250,6 +280,14 @@ class ElmoBiLM(gluon.Block):
             states_forward, states_backward = self.begin_state(batch_size=inputs.shape[1])
         outputs_forward, out_states_forward, outputs_backward, out_states_backward = self.encoder(embedded_inputs, states_forward, states_backward)
 
-        forward_out = self.decoder(outputs_forward[-1])
-        backward_out = self.decoder(outputs_backward[-1])
+
+        if self._dropout:
+            encoded_forward = nd.Dropout(outputs_forward[-1], p=self._dropout)
+            encoded_backward = nd.Dropout(outputs_backward[-1], p=self._dropout)
+        else:
+            encoded_forward = outputs_forward[-1]
+            encoded_backward = outputs_backward[-1]
+
+        forward_out = self.decoder(encoded_forward)
+        backward_out = self.decoder(encoded_backward)
         return (forward_out, backward_out), (states_forward, states_backward)

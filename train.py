@@ -64,6 +64,7 @@ parser.add_argument('--dropout_i', type=float, default=0.65,
                     help='dropout applied to input layer (0 = no dropout)')
 parser.add_argument('--weight_dropout', type=float, default=0,
                     help='weight dropout applied to h2h weight matrix (0 = no weight dropout)')
+parser.add_argument('--skip_connection', action='store_true', help='Add skip connections between RNN layers')
 parser.add_argument('--tied', action='store_true',
                     help='tie the word embedding and softmax weights')
 parser.add_argument('--log-interval', type=int, default=50, metavar='N',
@@ -71,11 +72,6 @@ parser.add_argument('--log-interval', type=int, default=50, metavar='N',
 parser.add_argument('--save', type=str, default='model.params',
                     help='path to save the final model')
 parser.add_argument('--load', action='store_true', help='Whether to load existing model weights from save')
-parser.add_argument('--gctype', type=str, default='none',
-                    help='type of gradient compression to use, \
-                          takes `2bit` or `none` for now.')
-parser.add_argument('--gcthreshold', type=float, default=0.5,
-                    help='threshold for 2bit gradient compression')
 parser.add_argument('--eval_only', action='store_true',
                     help='Whether to only evaluate the trained model')
 parser.add_argument('--gpus', type=str,
@@ -85,6 +81,7 @@ parser.add_argument('--hdf5_weight_file', type=str, default='elmo_weights.hdf5',
 parser.add_argument('--load_hdf5_bilstm', action='store_true', help='Whether to use load bilstm weights for hdf5 file')
 parser.add_argument('--load_hdf5_word_embed', action='store_true', help='Whether to use load word embedding weights for hdf5 file')
 parser.add_argument('--load_hdf5_char_embed', action='store_true', help='Whether to use load character embedding weights for hdf5 file')
+parser.add_argument('--load_hdf5_decoder', action='store_true', help='Whether to use load decoder weights for hdf5 file')
 
 args = parser.parse_args()
 
@@ -138,7 +135,7 @@ def get_batch_word_embedding(data_source, i, seq_len=None):
 ###############################################################################
 
 model = ElmoBiLM(mode=args.model, vocab_size=len(vocab), embed_size=args.emsize, hidden_size=args.nhid, cell_size=args.ncell,
-                 num_layers=args.nlayers, tie_weights=args.tied, dropout=args.dropout, char_embedding=args.char_embedding, weight_file=args.hdf5_weight_file)
+                 num_layers=args.nlayers, tie_weights=args.tied, dropout=args.dropout, skip_connection=args.skip_connection, char_embedding=args.char_embedding, weight_file=args.hdf5_weight_file)
 
 model.initialize(init.Xavier(), ctx=context)
 model.hybridize()
@@ -149,6 +146,8 @@ if args.hdf5_weight_file:
     if args.load_hdf5_bilstm:
         model.load_lstm_weights()
         # model.encoder.collect_params().setattr('grad_req', 'null')
+    if args.load_hdf5_decoder:
+        model.load_decoder()
 
 if args.char_embedding:
     model.set_highway_bias()
@@ -200,12 +199,13 @@ def evaluate(model, data_source, ctx):
             data, target = get_batch_char_embedding(data_source, i)
             data = data.as_in_context(ctx)
             target = target[0].as_in_context(ctx), target[1].as_in_context(ctx)
-            output, h = model(data, *hidden)
+            output, hidden = model(data, *hidden)
         else:
             data, target = get_batch_word_embedding(data_source, i)
             data = data.as_in_context(ctx)
             target = target.as_in_context(ctx)
-            output, h = model((data, target), *hidden)
+            output, hidden = model((data, target), *hidden)
+        hidden = detach(hidden)
 
         L = loss(mx.nd.reshape(output[0], (-3, -1)), mx.nd.reshape(target[0] if args.char_embedding else target, (-1,)))
         total_L += mx.nd.sum(L).asscalar()
@@ -248,9 +248,8 @@ def train():
             update_lr_epoch = 0
             best_val = val_L
             test_L = evaluate(model, test_data, context[0])
-            model.collect_params().save(args.save)
-            ppl = get_ppl(test_L)
-            print('test loss %.2f, test ppl %.2f' % (test_L, ppl))
+            model.save_params(args.save)
+            print('test loss %.2f, test ppl %.2f'%(test_L, math.exp(test_L)))
         else:
             update_lr_epoch += 1
             if update_lr_epoch % args.lr_update_interval == 0 and update_lr_epoch != 0:
@@ -319,8 +318,6 @@ def train_word(epoch, parameters):
 
     batch_i, i = 0, 0
     while i < len(train_data) - 1 - 1:
-        lr_batch_start = trainer.learning_rate
-        trainer.set_learning_rate(lr_batch_start)
         data, target = get_batch_word_embedding(train_data, i, seq_len=args.bptt)
 
         data_list = gluon.utils.split_and_load(data, context, batch_axis=1, even_split=True)
@@ -348,19 +345,19 @@ def train_word(epoch, parameters):
         trainer.step(1)
 
         total_L += sum([mx.nd.sum(l).asscalar() for l in Ls])
-        trainer.set_learning_rate(lr_batch_start)
 
         if batch_i % args.log_interval == 0 and batch_i > 0:
             cur_L = total_L / (args.log_interval * 2)
             print('[Epoch %d Batch %d/%d] loss %.2f, ppl %.2f, throughput %.2f samples/s, lr %.2f' % (
                 epoch, batch_i, len(train_data) // args.bptt, cur_L, get_ppl(cur_L),
-                args.batch_size * args.log_interval / (time.time() - start_log_interval_time), args.lr))
+                args.batch_size * args.log_interval / (time.time() - start_log_interval_time), trainer.learning_rate))
             total_L = 0.0
             start_log_interval_time = time.time()
         i += args.bptt
         batch_i += 1
 
 if __name__ == '__main__':
+    print(args)
     start_pipeline_time = time.time()
     if args.load:
         model.collect_params().load(args.save, context)
