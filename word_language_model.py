@@ -44,8 +44,10 @@ import math
 import os
 import sys
 import mxnet as mx
-from mxnet import gluon, autograd
+from mxnet import gluon, autograd, init, nd
+from mxnet.gluon import nn, Block, rnn
 import gluonnlp as nlp
+from gluonnlp.model.utils import _get_rnn_cell
 
 curr_path = os.path.dirname(os.path.abspath(os.path.expanduser(__file__)))
 sys.path.append(os.path.join(curr_path, '..', '..'))
@@ -110,6 +112,235 @@ parser.add_argument('--test_mode', action='store_true',
                     help='Whether to run through the script with few examples')
 args = parser.parse_args()
 
+def _get_rnn_cell(mode, num_layers, input_size, hidden_size, dropout):
+    """create rnn cell given specs"""
+    rnn_cell = rnn.SequentialRNNCell()
+    with rnn_cell.name_scope():
+        for i in range(num_layers):
+            if mode == 'rnn_relu':
+                cell = rnn.RNNCell(hidden_size, 'relu', input_size=input_size)
+            elif mode == 'rnn_tanh':
+                cell = rnn.RNNCell(hidden_size, 'tanh', input_size=input_size)
+            elif mode == 'lstm':
+                cell = rnn.LSTMCell(hidden_size, input_size=input_size)
+            elif mode == 'gru':
+                cell = rnn.GRUCell(hidden_size, input_size=input_size)
+
+            rnn_cell.add(cell)
+            if dropout != 0:
+                rnn_cell.add(rnn.DropoutCell(dropout))
+
+    return rnn_cell
+
+# class ElmoLSTMForward(gluon.Block):
+#     def __init__(self, mode, num_layers, input_size, hidden_size, cell_size, dropout, weight_dropout, char_embedding, weight_file=None, bidirectional=True):
+#         super(ElmoLSTM, self).__init__()
+#
+#         self.num_layers = num_layers
+#         self.char_embedding = char_embedding
+#         self.weight_file = weight_file
+#
+#         lstm_input_size = input_size
+#
+#         with self.name_scope():
+#             for layer_index in range(num_layers):
+#                 # forward_layer = LSTMPCell(hidden_size, cell_size, input_size=lstm_input_size, memory_cell_clip_value=3, state_projection_clip_value=3)
+#                 # backward_layer = LSTMPCell(hidden_size, cell_size, input_size=lstm_input_size, memory_cell_clip_value=3, state_projection_clip_value=3)
+#
+#                 forward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, 0 if layer_index == num_layers - 1 else dropout)#, cell_size=cell_size)
+#                 # backward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, 0 if layer_index == num_layers - 1 else dropout)#, cell_size=cell_size)
+#
+#                 setattr(self, 'forward_layer_{}'.format(layer_index), forward_layer)
+#                 # setattr(self, 'backward_layer_{}'.format(layer_index), backward_layer)
+#
+#                 lstm_input_size = hidden_size
+#
+#     def begin_state(self, *args, **kwargs):
+#         return [getattr(self, 'forward_layer_{}'.format(layer_index)).begin_state(*args, **kwargs) for layer_index in range(self.num_layers)]
+#                # [getattr(self, 'backward_layer_{}'.format(layer_index)).begin_state(*args, **kwargs) for layer_index in range(self.num_layers)]
+#
+#     def forward(self, inputs, states_forward=None):
+#         seq_len = inputs.shape[0] if self.char_embedding else inputs[0].shape[0]
+#
+#         if not states_forward:
+#             states_forward = self.begin_state(batch_size=inputs.shape[1] if self.char_embedding else inputs[0].shape[1])
+#
+#         outputs_forward = []
+#         out_states_forward = []
+#         # outputs_backward = []
+#         # out_states_backward = []
+#
+#         for j in range(self.num_layers):
+#             outputs_forward.append([])
+#             for i in range(seq_len):
+#                 if j == 0:
+#                     output, states_forward[j] = getattr(self, 'forward_layer_{}'.format(j))(inputs[i] if self.char_embedding else inputs[0][i], states_forward[j])
+#                 else:
+#                     output, states_forward[j] = getattr(self, 'forward_layer_{}'.format(j))(outputs_forward[j-1][i], states_forward[j])
+#                     # output = output + outputs_forward[j-1][i]
+#                 outputs_forward[j].append(output)
+#             out_states_forward.append(states_forward[j])
+#
+#             # outputs_backward.append([None] * seq_len)
+#             # for i in reversed(range(seq_len)):
+#             #     if j == 0:
+#             #         output, states_backward[j] = getattr(self, 'backward_layer_{}'.format(j))(inputs[i] if self.char_embedding else inputs[1][i], states_backward[j])
+#             #     else:
+#             #         output, states_backward[j] = getattr(self, 'backward_layer_{}'.format(j))(outputs_backward[j-1][i], states_backward[j])
+#             #         output = output + outputs_backward[j-1][i]
+#             #     outputs_backward[j][i] = output
+#             # out_states_backward.append(states_backward[j])
+#
+#         for i in range(self.num_layers):
+#             outputs_forward[i] = mx.nd.stack(*outputs_forward[i])
+#             # outputs_backward[i] = mx.nd.stack(*outputs_backward[i])
+#
+#         return outputs_forward, out_states_forward
+
+class ElmoLSTM(gluon.Block):
+    def __init__(self, mode, num_layers, input_size, hidden_size, cell_size, dropout, weight_dropout, char_embedding, weight_file=None, bidirectional=True):
+        super(ElmoLSTM, self).__init__()
+
+        self.num_layers = num_layers
+        self.char_embedding = char_embedding
+        self.weight_file = weight_file
+
+        lstm_input_size = input_size
+
+        with self.name_scope():
+            for layer_index in range(num_layers):
+                # forward_layer = LSTMPCell(hidden_size, cell_size, input_size=lstm_input_size, memory_cell_clip_value=3, state_projection_clip_value=3)
+                # backward_layer = LSTMPCell(hidden_size, cell_size, input_size=lstm_input_size, memory_cell_clip_value=3, state_projection_clip_value=3)
+
+                # forward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, 0 if layer_index == num_layers - 1 else dropout)#, cell_size=cell_size)
+                backward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, 0 if layer_index == num_layers - 1 else dropout)#, cell_size=cell_size)
+
+                # setattr(self, 'forward_layer_{}'.format(layer_index), forward_layer)
+                setattr(self, 'backward_layer_{}'.format(layer_index), backward_layer)
+
+                lstm_input_size = hidden_size
+
+    def begin_state(self, *args, **kwargs):
+        # return [getattr(self, 'forward_layer_{}'.format(layer_index)).begin_state(*args, **kwargs) for layer_index in range(self.num_layers)]
+        return [getattr(self, 'backward_layer_{}'.format(layer_index)).begin_state(*args, **kwargs) for layer_index in range(self.num_layers)]
+
+    def forward(self, inputs, states_backward=None):
+        seq_len = inputs.shape[0] if self.char_embedding else inputs[0].shape[0]
+
+        if not states_backward:
+            states_backward = self.begin_state(batch_size=inputs.shape[1] if self.char_embedding else inputs[0].shape[1])
+
+        # outputs_forward = []
+        # out_states_forward = []
+        outputs_backward = []
+        out_states_backward = []
+
+        for j in range(self.num_layers):
+            # outputs_forward.append([])
+            # for i in range(seq_len):
+            #     if j == 0:
+            #         output, states_forward[j] = getattr(self, 'forward_layer_{}'.format(j))(inputs[i] if self.char_embedding else inputs[0][i], states_forward[j])
+            #     else:
+            #         output, states_forward[j] = getattr(self, 'forward_layer_{}'.format(j))(outputs_forward[j-1][i], states_forward[j])
+            #         # output = output + outputs_forward[j-1][i]
+            #     outputs_forward[j].append(output)
+            # out_states_forward.append(states_forward[j])
+
+            outputs_backward.append([None] * seq_len)
+            for i in reversed(range(seq_len)):
+                if j == 0:
+                    output, states_backward[j] = getattr(self, 'backward_layer_{}'.format(j))(inputs[i] if self.char_embedding else inputs[1][i], states_backward[j])
+                else:
+                    output, states_backward[j] = getattr(self, 'backward_layer_{}'.format(j))(outputs_backward[j-1][i], states_backward[j])
+                    # output = output + outputs_backward[j-1][i]
+                outputs_backward[j][i] = output
+            out_states_backward.append(states_backward[j])
+
+        for i in range(self.num_layers):
+            # outputs_forward[i] = mx.nd.stack(*outputs_forward[i])
+            outputs_backward[i] = mx.nd.stack(*outputs_backward[i])
+
+        return outputs_backward, out_states_backward
+
+class StandardRNN(Block):
+    """Standard RNN language model.
+
+    Parameters
+    ----------
+    mode : str
+        The type of RNN to use. Options are 'lstm', 'gru', 'rnn_tanh', 'rnn_relu'.
+    vocab_size : int
+        Size of the input vocabulary.
+    embed_size : int
+        Dimension of embedding vectors.
+    hidden_size : int
+        Number of hidden units for RNN.
+    num_layers : int
+        Number of RNN layers.
+    dropout : float
+        Dropout rate to use for encoder output.
+    tie_weights : bool, default False
+        Whether to tie the weight matrices of output dense layer and input embedding layer.
+    """
+    def __init__(self, mode, vocab_size, embed_size, hidden_size,
+                 num_layers, dropout=0.5, tie_weights=False, **kwargs):
+        if tie_weights:
+            assert embed_size == hidden_size, 'Embedding dimension must be equal to ' \
+                                              'hidden dimension in order to tie weights. ' \
+                                              'Got: emb: {}, hid: {}.'.format(embed_size,
+                                                                              hidden_size)
+        super(StandardRNN, self).__init__(**kwargs)
+        self._mode = mode
+        self._embed_size = embed_size
+        self._hidden_size = hidden_size
+        self._num_layers = num_layers
+        self._dropout = dropout
+        self._tie_weights = tie_weights
+        self._vocab_size = vocab_size
+
+        with self.name_scope():
+            self.embedding = self._get_embedding()
+            self.encoder = self._get_encoder()
+            self.decoder = self._get_decoder()
+
+    def _get_embedding(self):
+        embedding = nn.HybridSequential()
+        with embedding.name_scope():
+            embedding.add(nn.Embedding(self._vocab_size, self._embed_size,
+                                       weight_initializer=init.Uniform(0.1)))
+            if self._dropout:
+                embedding.add(nn.Dropout(self._dropout))
+        return embedding
+
+    def _get_encoder(self):
+        return ElmoLSTM('lstm', args.nlayers, args.emsize, args.nhid, 0, args.dropout, 0, True)
+
+    def _get_decoder(self):
+        output = nn.HybridSequential()
+        with output.name_scope():
+            if self._tie_weights:
+                output.add(nn.Dense(self._vocab_size, flatten=False,
+                                    params=self.embedding[0].params))
+            else:
+                output.add(nn.Dense(self._vocab_size, flatten=False))
+        return output
+
+    def begin_state(self, *args, **kwargs):
+        return self.encoder.begin_state(*args, **kwargs)
+
+    def forward(self, inputs, begin_state=None): # pylint: disable=arguments-differ
+        """Defines the forward computation. Arguments can be either
+        :py:class:`NDArray` or :py:class:`Symbol`."""
+        encoded = self.embedding(inputs)
+        if not begin_state:
+            begin_state = self.begin_state(batch_size=inputs.shape[1])
+        output, state = self.encoder(encoded, begin_state)
+        encoded = output[-1]
+        if self._dropout:
+            encoded = nd.Dropout(encoded, p=self._dropout, axes=(0,))
+        out = self.decoder(encoded)
+        return out, state
+
 ###############################################################################
 # Load data
 ###############################################################################
@@ -161,9 +392,9 @@ if args.weight_dropout > 0:
                                             args.dropout, args.weight_dropout, args.dropout_h,
                                             args.dropout_i, args.dropout_e)
 else:
-    model = nlp.model.language_model.StandardRNN(args.model, len(vocab), args.emsize,
+    model = StandardRNN(args.model, len(vocab), args.emsize,
                                                  args.nhid, args.nlayers, args.dropout, args.tied)
-
+print(model)
 model.initialize(mx.init.Xavier(), ctx=context)
 
 if args.optimizer == 'sgd':
@@ -216,9 +447,9 @@ def evaluate(data_source, batch_size, ctx=None):
     """
     total_L = 0.0
     ntotal = 0
-    hidden = model.begin_state(batch_size, func=mx.nd.zeros, ctx=context[0])
+    hidden = model.begin_state(batch_size=batch_size, func=mx.nd.zeros, ctx=context[0])
     for i in range(0, len(data_source) - 1, args.bptt):
-        data, target = get_batch(data_source, i)
+        target, data = get_batch(data_source, i)
         data = data.as_in_context(ctx)
         target = target.as_in_context(ctx)
         output, hidden = model(data, hidden)
@@ -266,7 +497,8 @@ def forward(inputs, begin_state=None):
                 encoded = mx.nd.Dropout(encoded, p=model._drop_h, axes=(0,))
                 encoded_dropped.append(encoded)
     else:
-        encoded, state = model.encoder(encoded, begin_state)
+        output, state = model.encoder(encoded, begin_state)
+        encoded = output[-1]
         encoded_raw.append(encoded)
     if model._dropout:
         encoded = mx.nd.Dropout(encoded, p=model._dropout, axes=(0,))
@@ -325,7 +557,7 @@ def train():
         total_L = 0.0
         start_epoch_time = time.time()
         start_log_interval_time = time.time()
-        hiddens = [model.begin_state(args.batch_size//len(context),
+        hiddens = [model.begin_state(batch_size=args.batch_size//len(context),
                                      func=mx.nd.zeros, ctx=ctx) for ctx in context]
         batch_i, i = 0, 0
         while i < len(train_data) - 1 - 1:
@@ -342,8 +574,8 @@ def train():
             L = 0
             with autograd.record():
                 for j, (X, y, h) in enumerate(zip(data_list, target_list, hiddens)):
-                    output, h, encoder_hs, dropped_encoder_hs = forward(X, h)
-                    l = criterion(output, y, encoder_hs, dropped_encoder_hs)
+                    output, h, encoder_hs, dropped_encoder_hs = forward(y, h)
+                    l = criterion(output, X, encoder_hs, dropped_encoder_hs)
                     L = L + l.as_in_context(context[0]) / X.size
                     Ls.append(l/X.size)
                     hiddens[j] = h
