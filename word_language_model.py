@@ -49,6 +49,8 @@ from mxnet.gluon import nn, Block, rnn
 import gluonnlp as nlp
 from gluonnlp.model.utils import _get_rnn_cell
 
+from LSTMPCell import LSTMPCellWithClip
+
 curr_path = os.path.dirname(os.path.abspath(os.path.expanduser(__file__)))
 sys.path.append(os.path.join(curr_path, '..', '..'))
 
@@ -112,7 +114,7 @@ parser.add_argument('--test_mode', action='store_true',
                     help='Whether to run through the script with few examples')
 args = parser.parse_args()
 
-def _get_rnn_cell(mode, num_layers, input_size, hidden_size, dropout):
+def _get_rnn_cell(mode, num_layers, input_size, hidden_size, dropout, skip_connection, projection_size=None, cell_clip=None, projection_clip=None):
     """create rnn cell given specs"""
     rnn_cell = rnn.SequentialRNNCell()
     with rnn_cell.name_scope():
@@ -125,77 +127,17 @@ def _get_rnn_cell(mode, num_layers, input_size, hidden_size, dropout):
                 cell = rnn.LSTMCell(hidden_size, input_size=input_size)
             elif mode == 'gru':
                 cell = rnn.GRUCell(hidden_size, input_size=input_size)
+            elif mode == 'lstmp':
+                cell = LSTMPCellWithClip(hidden_size, projection_size, cell_clip=cell_clip, projection_clip=projection_clip, input_size=input_size)
+
+            if skip_connection:
+                cell = rnn.ResidualCell(cell)
 
             rnn_cell.add(cell)
+
             if dropout != 0:
                 rnn_cell.add(rnn.DropoutCell(dropout))
-
     return rnn_cell
-
-# class ElmoLSTMForward(gluon.Block):
-#     def __init__(self, mode, num_layers, input_size, hidden_size, cell_size, dropout, weight_dropout, char_embedding, weight_file=None, bidirectional=True):
-#         super(ElmoLSTM, self).__init__()
-#
-#         self.num_layers = num_layers
-#         self.char_embedding = char_embedding
-#         self.weight_file = weight_file
-#
-#         lstm_input_size = input_size
-#
-#         with self.name_scope():
-#             for layer_index in range(num_layers):
-#                 # forward_layer = LSTMPCell(hidden_size, cell_size, input_size=lstm_input_size, memory_cell_clip_value=3, state_projection_clip_value=3)
-#                 # backward_layer = LSTMPCell(hidden_size, cell_size, input_size=lstm_input_size, memory_cell_clip_value=3, state_projection_clip_value=3)
-#
-#                 forward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, 0 if layer_index == num_layers - 1 else dropout)#, cell_size=cell_size)
-#                 # backward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, 0 if layer_index == num_layers - 1 else dropout)#, cell_size=cell_size)
-#
-#                 setattr(self, 'forward_layer_{}'.format(layer_index), forward_layer)
-#                 # setattr(self, 'backward_layer_{}'.format(layer_index), backward_layer)
-#
-#                 lstm_input_size = hidden_size
-#
-#     def begin_state(self, *args, **kwargs):
-#         return [getattr(self, 'forward_layer_{}'.format(layer_index)).begin_state(*args, **kwargs) for layer_index in range(self.num_layers)]
-#                # [getattr(self, 'backward_layer_{}'.format(layer_index)).begin_state(*args, **kwargs) for layer_index in range(self.num_layers)]
-#
-#     def forward(self, inputs, states_forward=None):
-#         seq_len = inputs.shape[0] if self.char_embedding else inputs[0].shape[0]
-#
-#         if not states_forward:
-#             states_forward = self.begin_state(batch_size=inputs.shape[1] if self.char_embedding else inputs[0].shape[1])
-#
-#         outputs_forward = []
-#         out_states_forward = []
-#         # outputs_backward = []
-#         # out_states_backward = []
-#
-#         for j in range(self.num_layers):
-#             outputs_forward.append([])
-#             for i in range(seq_len):
-#                 if j == 0:
-#                     output, states_forward[j] = getattr(self, 'forward_layer_{}'.format(j))(inputs[i] if self.char_embedding else inputs[0][i], states_forward[j])
-#                 else:
-#                     output, states_forward[j] = getattr(self, 'forward_layer_{}'.format(j))(outputs_forward[j-1][i], states_forward[j])
-#                     # output = output + outputs_forward[j-1][i]
-#                 outputs_forward[j].append(output)
-#             out_states_forward.append(states_forward[j])
-#
-#             # outputs_backward.append([None] * seq_len)
-#             # for i in reversed(range(seq_len)):
-#             #     if j == 0:
-#             #         output, states_backward[j] = getattr(self, 'backward_layer_{}'.format(j))(inputs[i] if self.char_embedding else inputs[1][i], states_backward[j])
-#             #     else:
-#             #         output, states_backward[j] = getattr(self, 'backward_layer_{}'.format(j))(outputs_backward[j-1][i], states_backward[j])
-#             #         output = output + outputs_backward[j-1][i]
-#             #     outputs_backward[j][i] = output
-#             # out_states_backward.append(states_backward[j])
-#
-#         for i in range(self.num_layers):
-#             outputs_forward[i] = mx.nd.stack(*outputs_forward[i])
-#             # outputs_backward[i] = mx.nd.stack(*outputs_backward[i])
-#
-#         return outputs_forward, out_states_forward
 
 class ElmoLSTM(gluon.Block):
     def __init__(self, mode, num_layers, input_size, hidden_size, cell_size, dropout, weight_dropout, char_embedding, weight_file=None, bidirectional=True):
@@ -212,39 +154,40 @@ class ElmoLSTM(gluon.Block):
                 # forward_layer = LSTMPCell(hidden_size, cell_size, input_size=lstm_input_size, memory_cell_clip_value=3, state_projection_clip_value=3)
                 # backward_layer = LSTMPCell(hidden_size, cell_size, input_size=lstm_input_size, memory_cell_clip_value=3, state_projection_clip_value=3)
 
-                # forward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, 0 if layer_index == num_layers - 1 else dropout)#, cell_size=cell_size)
-                backward_layer = _get_rnn_cell(mode, 1, lstm_input_size, hidden_size, 0 if layer_index == num_layers - 1 else dropout)#, cell_size=cell_size)
+                forward_layer = _get_rnn_cell(mode=mode, num_layers=1, input_size=lstm_input_size, hidden_size=hidden_size,
+                                              dropout=0 if layer_index == num_layers - 1 else dropout, skip_connection=False, projection_size=0, cell_clip=None, projection_clip=None)
+                backward_layer = _get_rnn_cell(mode=mode, num_layers=1, input_size=lstm_input_size, hidden_size=hidden_size,
+                                              dropout=0 if layer_index == num_layers - 1 else dropout, skip_connection=False, projection_size=0, cell_clip=None, projection_clip=None)
 
-                # setattr(self, 'forward_layer_{}'.format(layer_index), forward_layer)
+                setattr(self, 'forward_layer_{}'.format(layer_index), forward_layer)
                 setattr(self, 'backward_layer_{}'.format(layer_index), backward_layer)
 
                 lstm_input_size = hidden_size
 
     def begin_state(self, *args, **kwargs):
-        # return [getattr(self, 'forward_layer_{}'.format(layer_index)).begin_state(*args, **kwargs) for layer_index in range(self.num_layers)]
-        return [getattr(self, 'backward_layer_{}'.format(layer_index)).begin_state(*args, **kwargs) for layer_index in range(self.num_layers)]
+        return [getattr(self, 'forward_layer_{}'.format(layer_index)).begin_state(*args, **kwargs) for layer_index in range(self.num_layers)],\
+               [getattr(self, 'backward_layer_{}'.format(layer_index)).begin_state(*args, **kwargs) for layer_index in range(self.num_layers)]
 
-    def forward(self, inputs, states_backward=None):
+    def forward(self, inputs, states):
         seq_len = inputs.shape[0] if self.char_embedding else inputs[0].shape[0]
 
-        if not states_backward:
-            states_backward = self.begin_state(batch_size=inputs.shape[1] if self.char_embedding else inputs[0].shape[1])
+        if not states:
+            states_forward, states_backward = self.begin_state(batch_size=inputs.shape[1] if self.char_embedding else inputs[0].shape[1])
+        else:
+            states_forward, states_backward = states
 
-        # outputs_forward = []
-        # out_states_forward = []
+        outputs_forward = []
         outputs_backward = []
-        out_states_backward = []
 
         for j in range(self.num_layers):
-            # outputs_forward.append([])
-            # for i in range(seq_len):
-            #     if j == 0:
-            #         output, states_forward[j] = getattr(self, 'forward_layer_{}'.format(j))(inputs[i] if self.char_embedding else inputs[0][i], states_forward[j])
-            #     else:
-            #         output, states_forward[j] = getattr(self, 'forward_layer_{}'.format(j))(outputs_forward[j-1][i], states_forward[j])
-            #         # output = output + outputs_forward[j-1][i]
-            #     outputs_forward[j].append(output)
-            # out_states_forward.append(states_forward[j])
+            outputs_forward.append([])
+            for i in range(seq_len):
+                if j == 0:
+                    output, states_forward[j] = getattr(self, 'forward_layer_{}'.format(j))(inputs[i] if self.char_embedding else inputs[0][i], states_forward[j])
+                else:
+                    output, states_forward[j] = getattr(self, 'forward_layer_{}'.format(j))(outputs_forward[j-1][i], states_forward[j])
+                    # output = output + outputs_forward[j-1][i]
+                outputs_forward[j].append(output)
 
             outputs_backward.append([None] * seq_len)
             for i in reversed(range(seq_len)):
@@ -254,15 +197,14 @@ class ElmoLSTM(gluon.Block):
                     output, states_backward[j] = getattr(self, 'backward_layer_{}'.format(j))(outputs_backward[j-1][i], states_backward[j])
                     # output = output + outputs_backward[j-1][i]
                 outputs_backward[j][i] = output
-            out_states_backward.append(states_backward[j])
 
         for i in range(self.num_layers):
-            # outputs_forward[i] = mx.nd.stack(*outputs_forward[i])
+            outputs_forward[i] = mx.nd.stack(*outputs_forward[i])
             outputs_backward[i] = mx.nd.stack(*outputs_backward[i])
 
-        return outputs_backward, out_states_backward
+        return (outputs_forward, outputs_backward), (states_forward, states_backward)
 
-class StandardRNN(Block):
+class ElmoBiLM(Block):
     """Standard RNN language model.
 
     Parameters
@@ -283,13 +225,13 @@ class StandardRNN(Block):
         Whether to tie the weight matrices of output dense layer and input embedding layer.
     """
     def __init__(self, mode, vocab_size, embed_size, hidden_size,
-                 num_layers, dropout=0.5, tie_weights=False, **kwargs):
+                 num_layers, dropout=0.5, tie_weights=False, char_embedding=False, **kwargs):
         if tie_weights:
             assert embed_size == hidden_size, 'Embedding dimension must be equal to ' \
                                               'hidden dimension in order to tie weights. ' \
                                               'Got: emb: {}, hid: {}.'.format(embed_size,
                                                                               hidden_size)
-        super(StandardRNN, self).__init__(**kwargs)
+        super(ElmoBiLM, self).__init__(**kwargs)
         self._mode = mode
         self._embed_size = embed_size
         self._hidden_size = hidden_size
@@ -297,6 +239,7 @@ class StandardRNN(Block):
         self._dropout = dropout
         self._tie_weights = tie_weights
         self._vocab_size = vocab_size
+        self._char_embedding = char_embedding
 
         with self.name_scope():
             self.embedding = self._get_embedding()
@@ -313,7 +256,7 @@ class StandardRNN(Block):
         return embedding
 
     def _get_encoder(self):
-        return ElmoLSTM('lstm', args.nlayers, args.emsize, args.nhid, 0, args.dropout, 0, True)
+        return ElmoLSTM('lstm', args.nlayers, args.emsize, args.nhid, 0, args.dropout, 0, False)
 
     def _get_decoder(self):
         output = nn.HybridSequential()
@@ -331,15 +274,27 @@ class StandardRNN(Block):
     def forward(self, inputs, begin_state=None): # pylint: disable=arguments-differ
         """Defines the forward computation. Arguments can be either
         :py:class:`NDArray` or :py:class:`Symbol`."""
-        encoded = self.embedding(inputs)
+        if self._char_embedding:
+            encoded = self.embedding(inputs)
+        else:
+            encoded = self.embedding(inputs[0]), self.embedding(inputs[1])
+
         if not begin_state:
-            begin_state = self.begin_state(batch_size=inputs.shape[1])
-        output, state = self.encoder(encoded, begin_state)
-        encoded = output[-1]
+            begin_state = self.begin_state(batch_size=inputs.shape[1] if self._char_embedding else inputs[0].shape[1])
+
+        encoded, state = self.encoder(encoded, begin_state)
+
         if self._dropout:
-            encoded = nd.Dropout(encoded, p=self._dropout, axes=(0,))
-        out = self.decoder(encoded)
-        return out, state
+            encoded_forward = nd.Dropout(encoded[0][-1], p=self._dropout)
+            encoded_backward = nd.Dropout(encoded[1][-1], p=self._dropout)
+        else:
+            encoded_forward = encoded[0][-1]
+            encoded_backward = encoded[1][-1]
+
+        forward_out = self.decoder(encoded_forward)
+        backward_out = self.decoder(encoded_backward)
+
+        return (forward_out, backward_out), state
 
 ###############################################################################
 # Load data
@@ -362,9 +317,9 @@ train_dataset, val_dataset, test_dataset = \
 vocab = nlp.Vocab(counter=nlp.data.Counter(train_dataset[0]), padding_token=None, bos_token=None)
 
 train_data = train_dataset.batchify(vocab, args.batch_size)
-val_batch_size = 10
+val_batch_size = args.batch_size
 val_data = val_dataset.batchify(vocab, val_batch_size)
-test_batch_size = 1
+test_batch_size = args.batch_size
 test_data = test_dataset.batchify(vocab, test_batch_size)
 
 if args.test_mode:
@@ -392,10 +347,11 @@ if args.weight_dropout > 0:
                                             args.dropout, args.weight_dropout, args.dropout_h,
                                             args.dropout_i, args.dropout_e)
 else:
-    model = StandardRNN(args.model, len(vocab), args.emsize,
+    model = ElmoBiLM(args.model, len(vocab), args.emsize,
                                                  args.nhid, args.nlayers, args.dropout, args.tied)
 print(model)
 model.initialize(mx.init.Xavier(), ctx=context)
+model.hybridize()
 
 if args.optimizer == 'sgd':
     trainer_params = {'learning_rate': args.lr,
@@ -449,15 +405,20 @@ def evaluate(data_source, batch_size, ctx=None):
     ntotal = 0
     hidden = model.begin_state(batch_size=batch_size, func=mx.nd.zeros, ctx=context[0])
     for i in range(0, len(data_source) - 1, args.bptt):
-        target, data = get_batch(data_source, i)
+        data, target = get_batch(data_source, i)
         data = data.as_in_context(ctx)
         target = target.as_in_context(ctx)
-        output, hidden = model(data, hidden)
+        output, hidden = model((data, target), hidden)
         hidden = detach(hidden)
-        L = loss(output.reshape(-3, -1),
+        L = loss(output[0].reshape(-3, -1),
                  target.reshape(-1,))
         total_L += mx.nd.sum(L).asscalar()
-        ntotal += L.size
+
+        L = loss(output[1].reshape(-3, -1),
+                 data.reshape(-1,))
+        total_L += mx.nd.sum(L).asscalar()
+
+        ntotal += 2 * L.size
     return total_L / ntotal
 
 
@@ -482,36 +443,31 @@ def forward(inputs, begin_state=None):
     encoded_dropped: list
         The list of outputs with dropout of the model's encoder.
     """
-    encoded = model.embedding(inputs)
+    if model._char_embedding:
+        encoded = model.embedding(inputs)
+    else:
+        encoded = model.embedding(inputs[0]), model.embedding(inputs[1])
+
     if not begin_state:
-        begin_state = model.begin_state(batch_size=inputs.shape[1])
+        begin_state = model.begin_state(batch_size=inputs.shape[1] if model._char_embedding else inputs[0].shape[1])
     out_states = []
     encoded_raw = []
     encoded_dropped = []
-    if args.weight_dropout > 0:
-        for i, (e, s) in enumerate(zip(model.encoder, begin_state)):
-            encoded, state = e(encoded, s)
-            encoded_raw.append(encoded)
-            out_states.append(state)
-            if model._drop_h and i != len(model.encoder)-1:
-                encoded = mx.nd.Dropout(encoded, p=model._drop_h, axes=(0,))
-                encoded_dropped.append(encoded)
-    else:
-        output, state = model.encoder(encoded, begin_state)
-        encoded = output[-1]
-        encoded_raw.append(encoded)
+
+    encoded, state = model.encoder(encoded, begin_state)
+    encoded_raw.append(encoded)
+
     if model._dropout:
-        encoded = mx.nd.Dropout(encoded, p=model._dropout, axes=(0,))
-    if args.weight_dropout > 0:
-        encoded_dropped.append(encoded)
-        with autograd.predict_mode():
-            out = model.decoder(encoded)
+        encoded_forward = nd.Dropout(encoded[0][-1], p=model._dropout)
+        encoded_backward = nd.Dropout(encoded[1][-1], p=model._dropout)
     else:
-        out = model.decoder(encoded)
-    if args.weight_dropout > 0:
-        return out, out_states, encoded_raw, encoded_dropped
-    else:
-        return out, state, encoded_raw, encoded_dropped
+        encoded_forward = encoded[0][-1]
+        encoded_backward = encoded[1][-1]
+
+    forward_out = model.decoder(encoded_forward)
+    backward_out = model.decoder(encoded_backward)
+
+    return (forward_out, backward_out), state, encoded_raw, encoded_dropped
 
 def criterion(output, target, encoder_hs, dropped_encoder_hs):
     """Compute regularized (optional) loss of the language model in training mode.
@@ -574,10 +530,15 @@ def train():
             L = 0
             with autograd.record():
                 for j, (X, y, h) in enumerate(zip(data_list, target_list, hiddens)):
-                    output, h, encoder_hs, dropped_encoder_hs = forward(y, h)
-                    l = criterion(output, X, encoder_hs, dropped_encoder_hs)
+                    output, h, encoder_hs, dropped_encoder_hs = forward((X, y), h)
+                    l = criterion(output[0], y, encoder_hs, dropped_encoder_hs)
                     L = L + l.as_in_context(context[0]) / X.size
                     Ls.append(l/X.size)
+
+                    l = criterion(output[1], X, encoder_hs, dropped_encoder_hs)
+                    L = L + l.as_in_context(context[0]) / X.size
+                    Ls.append(l/X.size)
+
                     hiddens[j] = h
             L.backward()
             grads = [p.grad(d.context) for p in parameters for d in data_list]
@@ -585,7 +546,7 @@ def train():
 
             trainer.step(1)
 
-            total_L += sum([mx.nd.sum(L).asscalar() for L in Ls])
+            total_L += sum([mx.nd.sum(L).asscalar() for L in Ls]) / 2
             trainer.set_learning_rate(lr_batch_start)
             if batch_i % args.log_interval == 0 and batch_i > 0:
                 cur_L = total_L / args.log_interval
