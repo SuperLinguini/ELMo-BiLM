@@ -58,11 +58,14 @@ sys.path.append(os.path.join(curr_path, '..', '..'))
 parser = argparse.ArgumentParser(description=
                                  'MXNet Autograd RNN/LSTM Language Model on Wikitext-2.')
 parser.add_argument('--model', type=str, default='lstm',
-                    help='type of recurrent net (rnn_tanh, rnn_relu, lstm, gru)')
+                    help='type of recurrent net (rnn_tanh, rnn_relu, lstm, gru, lstmp)')
 parser.add_argument('--emsize', type=int, default=400,
                     help='size of word embeddings')
 parser.add_argument('--nhid', type=int, default=1150,
                     help='number of hidden units per layer')
+parser.add_argument('--cellclip', type=float, help='clip cell state between [-cellclip, projclip] in LSTMPCellWithClip')
+parser.add_argument('--projsize', type=int, help='projection of nhid to projsize in LSTMPCellWithClip')
+parser.add_argument('--projclip', type=float, help='clip projection between [-projclip, projclip] in LSTMPCellWithClip')
 parser.add_argument('--nlayers', type=int, default=3,
                     help='number of layers')
 parser.add_argument('--lr', type=float, default=30,
@@ -104,6 +107,8 @@ parser.add_argument('--optimizer', type=str, default='sgd',
                     help='optimizer to use (sgd, adam)')
 parser.add_argument('--wd', type=float, default=1.2e-6,
                     help='weight decay applied to all weights')
+parser.add_argument('--skip_connection', action='store_true', help='add skip connections (add cell input to output)')
+parser.add_argument('--char_embedding', action='store_true', help='Whether to use character embeddings or word embeddings')
 parser.add_argument('--alpha', type=float, default=2,
                     help='alpha L2 regularization on RNN activation '
                          '(alpha = 0 means no regularization)')
@@ -114,7 +119,7 @@ parser.add_argument('--test_mode', action='store_true',
                     help='Whether to run through the script with few examples')
 args = parser.parse_args()
 
-def _get_rnn_cell(mode, num_layers, input_size, hidden_size, dropout, skip_connection, projection_size=None, cell_clip=None, projection_clip=None):
+def _get_rnn_cell(mode, num_layers, input_size, hidden_size, dropout, skip_connection, proj_size=None, cell_clip=None, proj_clip=None):
     """create rnn cell given specs"""
     rnn_cell = rnn.SequentialRNNCell()
     with rnn_cell.name_scope():
@@ -128,7 +133,7 @@ def _get_rnn_cell(mode, num_layers, input_size, hidden_size, dropout, skip_conne
             elif mode == 'gru':
                 cell = rnn.GRUCell(hidden_size, input_size=input_size)
             elif mode == 'lstmp':
-                cell = LSTMPCellWithClip(hidden_size, projection_size, cell_clip=cell_clip, projection_clip=projection_clip, input_size=input_size)
+                cell = LSTMPCellWithClip(hidden_size, proj_size, cell_clip=cell_clip, projection_clip=proj_clip, input_size=input_size)
 
             if skip_connection:
                 cell = rnn.ResidualCell(cell)
@@ -140,7 +145,7 @@ def _get_rnn_cell(mode, num_layers, input_size, hidden_size, dropout, skip_conne
     return rnn_cell
 
 class ElmoLSTM(gluon.Block):
-    def __init__(self, mode, num_layers, input_size, hidden_size, cell_size, dropout, weight_dropout, char_embedding, weight_file=None, bidirectional=True):
+    def __init__(self, mode, num_layers, input_size, hidden_size, dropout, skip_connection, char_embedding, proj_size=None, cell_clip=None, proj_clip=None, weight_file=None, bidirectional=True):
         super(ElmoLSTM, self).__init__()
 
         self.num_layers = num_layers
@@ -151,18 +156,17 @@ class ElmoLSTM(gluon.Block):
 
         with self.name_scope():
             for layer_index in range(num_layers):
-                # forward_layer = LSTMPCell(hidden_size, cell_size, input_size=lstm_input_size, memory_cell_clip_value=3, state_projection_clip_value=3)
-                # backward_layer = LSTMPCell(hidden_size, cell_size, input_size=lstm_input_size, memory_cell_clip_value=3, state_projection_clip_value=3)
-
                 forward_layer = _get_rnn_cell(mode=mode, num_layers=1, input_size=lstm_input_size, hidden_size=hidden_size,
-                                              dropout=0 if layer_index == num_layers - 1 else dropout, skip_connection=False, projection_size=0, cell_clip=None, projection_clip=None)
+                                              dropout=0 if layer_index == num_layers - 1 else dropout, skip_connection=False if layer_index == 0 else skip_connection,
+                                              proj_size=proj_size, cell_clip=cell_clip, proj_clip=proj_clip)
                 backward_layer = _get_rnn_cell(mode=mode, num_layers=1, input_size=lstm_input_size, hidden_size=hidden_size,
-                                              dropout=0 if layer_index == num_layers - 1 else dropout, skip_connection=False, projection_size=0, cell_clip=None, projection_clip=None)
+                                              dropout=0 if layer_index == num_layers - 1 else dropout, skip_connection=False if layer_index == 0 else skip_connection,
+                                              proj_size=proj_size, cell_clip=cell_clip, proj_clip=proj_clip)
 
                 setattr(self, 'forward_layer_{}'.format(layer_index), forward_layer)
                 setattr(self, 'backward_layer_{}'.format(layer_index), backward_layer)
 
-                lstm_input_size = hidden_size
+                lstm_input_size = proj_size if mode == 'lstmp' else hidden_size
 
     def begin_state(self, *args, **kwargs):
         return [getattr(self, 'forward_layer_{}'.format(layer_index)).begin_state(*args, **kwargs) for layer_index in range(self.num_layers)],\
@@ -224,8 +228,8 @@ class ElmoBiLM(Block):
     tie_weights : bool, default False
         Whether to tie the weight matrices of output dense layer and input embedding layer.
     """
-    def __init__(self, mode, vocab_size, embed_size, hidden_size,
-                 num_layers, dropout=0.5, tie_weights=False, char_embedding=False, **kwargs):
+    def __init__(self, mode, vocab_size, embed_size, hidden_size, num_layers, dropout=0.5, tie_weights=False, char_embedding=False,
+                 skip_connection=False, proj_size=None, proj_clip=None, cell_clip=None, **kwargs):
         if tie_weights:
             assert embed_size == hidden_size, 'Embedding dimension must be equal to ' \
                                               'hidden dimension in order to tie weights. ' \
@@ -235,6 +239,10 @@ class ElmoBiLM(Block):
         self._mode = mode
         self._embed_size = embed_size
         self._hidden_size = hidden_size
+        self._skip_connection = skip_connection
+        self._proj_size = proj_size
+        self._proj_clip = proj_clip
+        self._cell_clip = cell_clip
         self._num_layers = num_layers
         self._dropout = dropout
         self._tie_weights = tie_weights
@@ -256,7 +264,10 @@ class ElmoBiLM(Block):
         return embedding
 
     def _get_encoder(self):
-        return ElmoLSTM('lstm', args.nlayers, args.emsize, args.nhid, 0, args.dropout, 0, False)
+        return ElmoLSTM(mode=self._mode, num_layers=self._num_layers, input_size=self._embed_size,
+                              hidden_size=self._hidden_size, proj_size=self._proj_size, dropout=self._dropout,
+                              skip_connection=self._skip_connection, char_embedding=self._char_embedding,
+                              cell_clip=self._cell_clip, proj_clip=self._proj_clip)
 
     def _get_decoder(self):
         output = nn.HybridSequential()
@@ -340,15 +351,10 @@ print(args)
 
 ntokens = len(vocab)
 
-if args.weight_dropout > 0:
-    print('Use AWDRNN')
-    model = nlp.model.language_model.AWDRNN(args.model, len(vocab), args.emsize,
-                                            args.nhid, args.nlayers, args.tied,
-                                            args.dropout, args.weight_dropout, args.dropout_h,
-                                            args.dropout_i, args.dropout_e)
-else:
-    model = ElmoBiLM(args.model, len(vocab), args.emsize,
-                                                 args.nhid, args.nlayers, args.dropout, args.tied)
+model = ElmoBiLM(mode=args.model, vocab_size=len(vocab), embed_size=args.emsize, hidden_size=args.nhid, num_layers=args.nlayers,
+                 tie_weights=args.tied, dropout=args.dropout, skip_connection=args.skip_connection, proj_size=args.projsize,
+                 proj_clip=args.projclip, cell_clip=args.cellclip, char_embedding=args.char_embedding)
+
 print(model)
 model.initialize(mx.init.Xavier(), ctx=context)
 model.hybridize()
@@ -363,6 +369,9 @@ elif args.optimizer == 'adam':
                       'beta1': 0,
                       'beta2': 0.999,
                       'epsilon': 1e-9}
+elif args.optimizer == 'adagrad':
+    trainer_params = {'learning_rate': args.lr,
+                      'wd': args.wd}
 
 trainer = gluon.Trainer(model.collect_params(), args.optimizer, trainer_params)
 loss = gluon.loss.SoftmaxCrossEntropyLoss()
@@ -383,6 +392,13 @@ def detach(hidden):
     else:
         hidden = hidden.detach()
     return hidden
+
+def get_ppl(cur_loss):
+    try:
+        ppl = math.exp(cur_loss)
+    except:
+        ppl = float('inf')
+    return ppl
 
 def evaluate(data_source, batch_size, ctx=None):
     """Evaluate the model on the dataset.
